@@ -1822,6 +1822,13 @@ private:
     unsigned other_phase = use_phase ^ 1;
 
     assert( node_data.best_gate[0] != nullptr || node_data.best_gate[1] != nullptr );
+    if ( node_data.best_gate[0] == nullptr && node_data.best_gate[1] == nullptr )
+    {
+      /* cover-completeness invariant broken (should be unreachable: match_phase_relaxed keeps
+       * every referenced node matched) — report loudly instead of dereferencing null below */
+      std::cerr << fmt::format( "[e] emap: node {} has no match in either phase; skipping required-time propagation\n", index );
+      return;
+    }
     // assert( node_data.map_refs[0] || node_data.map_refs[1] );
 
     /* propagate required time over the output inverter if present */
@@ -2576,6 +2583,115 @@ private:
 
       ++cut_index;
     }
+
+    if constexpr ( DO_AREA )
+    {
+      if ( node_data.best_gate[phase] == nullptr )
+      {
+        /* no candidate met the required time (multi-output squeeze, see match_phase_relaxed):
+         * re-match ignoring required times to keep the node covered */
+        match_phase_relaxed<false, false>( n, phase );
+      }
+    }
+  }
+
+  /* Fallback single-output match that ignores required times.
+   *
+   * With multi-output mapping, a node's required time can be set by a multi-output pin that is
+   * faster than ANY single-output implementation of that node. This is possible when the
+   * multi-output cell has no delay-matching single-output cover in the library (the library
+   * loader warns about such cells). The required-filtered searches in match_phase /
+   * match_phase_exact then find no candidate at all, leaving a referenced node without a match
+   * in either phase — and the later required-time propagation would dereference a null gate.
+   * This fallback restores the cover-completeness invariant (every referenced node has a valid
+   * match) by picking the fastest implementable match, accepting the (already warned) local
+   * required-time violation. The multi-output re-match runs after the phase matches, so when the
+   * multi-output gate is still usable it supersedes this fallback and the violation disappears. */
+  template<bool ExactArea, bool SwitchActivity>
+  void match_phase_relaxed( node<Ntk> const& n, uint8_t phase )
+  {
+    double best_arrival = std::numeric_limits<double>::max();
+    float best_flow = std::numeric_limits<float>::max();
+    float best_area = std::numeric_limits<float>::max();
+    uint32_t best_size = UINT32_MAX;
+    uint32_t best_cut = 0u;
+    uint16_t best_phase = 0u;
+    supergate<NInputs> const* best_gate = nullptr;
+    uint32_t cut_index = 0u;
+    auto index = ntk.node_to_index( n );
+
+    auto& node_data = node_match[index];
+
+    /* foreach cut */
+    for ( auto& cut : cuts[index] )
+    {
+      /* trivial cuts or not matched cuts */
+      if ( ( *cut )->ignore )
+      {
+        ++cut_index;
+        continue;
+      }
+
+      auto const& supergates = ( *cut )->supergates;
+      auto const negation = ( *cut )->negations[phase];
+
+      if ( supergates[phase] == nullptr )
+      {
+        ++cut_index;
+        continue;
+      }
+
+      /* match each gate and take the fastest one (smallest required-time violation) */
+      for ( auto const& gate : *supergates[phase] )
+      {
+        uint16_t gate_polarity = gate.polarity ^ negation;
+        double worst_arrival = 0.0f;
+        float flow = gate.area;
+
+        auto ctr = 0u;
+        for ( auto l : *cut )
+        {
+          uint8_t leaf_phase = ( gate_polarity >> ctr ) & 1;
+          worst_arrival = std::max( worst_arrival, node_match[l].arrival[leaf_phase] + gate.tdelay[ctr] );
+          if constexpr ( !ExactArea )
+            flow += node_match[l].flows[leaf_phase];
+          ++ctr;
+        }
+
+        if ( worst_arrival >= std::numeric_limits<float>::max() )
+          continue;
+
+        if constexpr ( ExactArea )
+        {
+          node_data.phase[phase] = gate_polarity;
+          node_data.area[phase] = gate.area;
+          flow = cut_measure_mffc<SwitchActivity>( *cut, n, phase );
+        }
+
+        if ( compare_map<false>( worst_arrival, best_arrival, flow, best_flow, cut->size(), best_size ) )
+        {
+          best_arrival = worst_arrival;
+          best_flow = flow;
+          best_area = gate.area;
+          best_size = cut->size();
+          best_cut = cut_index;
+          best_phase = gate_polarity;
+          best_gate = &gate;
+        }
+      }
+
+      ++cut_index;
+    }
+
+    if ( best_gate == nullptr )
+      return; /* no single-output implementation at all: leave the (pre-existing) unmatched state */
+
+    node_data.flows[phase] = best_flow;
+    node_data.arrival[phase] = best_arrival;
+    node_data.area[phase] = best_area;
+    node_data.best_cut[phase] = best_cut;
+    node_data.phase[phase] = best_phase;
+    node_data.best_gate[phase] = best_gate;
   }
 
   template<bool SwitchActivity>
@@ -2616,6 +2732,10 @@ private:
         cut_deref<SwitchActivity>( cut, n, phase );
       }
     }
+
+    /* the search below starts from scratch: a failed search must not keep the previous gate
+     * paired with an unrelated best_cut (index 0) — it falls back to a relaxed re-match instead */
+    best_gate = nullptr;
 
     /* foreach cut */
     for ( auto& cut : cuts[index] )
@@ -2670,6 +2790,21 @@ private:
       }
 
       ++cut_index;
+    }
+
+    if ( best_gate == nullptr )
+    {
+      /* no candidate met the required time (multi-output squeeze, see match_phase_relaxed):
+       * re-match ignoring required times to keep the node covered */
+      node_data.best_gate[phase] = nullptr;
+      node_data.arrival[phase] = best_arrival;
+      node_data.flows[phase] = best_exact_area;
+      match_phase_relaxed<true, SwitchActivity>( n, phase );
+      if ( node_data.best_gate[phase] != nullptr && !node_data.same_match && node_data.map_refs[phase] )
+      {
+        cut_ref<SwitchActivity>( cuts[index][node_data.best_cut[phase]], n, phase );
+      }
+      return;
     }
 
     node_data.flows[phase] = best_exact_area;
