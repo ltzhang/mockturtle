@@ -6,6 +6,7 @@
 #include <lorina/genlib.hpp>
 #include <lorina/super.hpp>
 #include <mockturtle/algorithms/emap.hpp>
+#include <mockturtle/algorithms/simulation.hpp>
 #include <mockturtle/generators/arithmetic.hpp>
 #include <mockturtle/io/genlib_reader.hpp>
 #include <mockturtle/io/super_reader.hpp>
@@ -344,6 +345,43 @@ TEST_CASE( "Emap on ripple carry adder with multi-output cells", "[emap]" )
   CHECK( st.delay > 17.3f - eps );
   CHECK( st.delay < 17.3f + eps );
   CHECK( st.multioutput_gates == 8 );
+}
+
+TEST_CASE( "Emap preserves outputs across transitive multi-output dependencies", "[emap]" )
+{
+  std::vector<gate> gates;
+  std::istringstream in( test_library );
+  CHECK( lorina::read_genlib( in, genlib_reader( gates ) ) == lorina::return_code::success );
+
+  tech_library_params tps;
+  tps.load_multioutput_gates = true;
+  tech_library<3, classification_type::p_configurations> lib( gates, tps );
+
+  aig_network aig;
+  const auto a = aig.create_pi();
+  const auto b = aig.create_pi();
+  const auto c = aig.create_pi();
+  const auto carry = aig.create_maj( a, b, c );
+  const auto abc = aig.create_and( aig.create_and( a, b ), c );
+  const auto any = aig.create_or( aig.create_or( a, b ), c );
+  const auto sum_when_carry = aig.create_and( carry, abc );
+  const auto sum_when_no_carry = aig.create_and( !carry, any );
+  const auto sum = aig.create_or( sum_when_carry, sum_when_no_carry );
+  aig.create_po( aig.create_xor( sum_when_carry, sum ) );
+
+  emap_params ps;
+  ps.area_oriented_mapping = true;
+  emap_stats st;
+
+  const cell_view<block_network> baseline = emap( aig, lib, ps, &st );
+  CHECK( simulate<kitty::static_truth_table<3u>>( baseline ) ==
+         simulate<kitty::static_truth_table<3u>>( aig ) );
+
+  ps.map_multioutput = true;
+  const cell_view<block_network> mapped = emap( aig, lib, ps, &st );
+
+  CHECK( simulate<kitty::static_truth_table<3u>>( mapped ) ==
+         simulate<kitty::static_truth_table<3u>>( aig ) );
 }
 
 TEST_CASE( "Emap on multiplier with multi-output gates", "[emap]" )

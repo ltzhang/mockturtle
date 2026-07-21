@@ -5656,9 +5656,9 @@ private:
         uint32_t in_tfi = multi_is_in_direct_tfi( ntk.index_to_node( index2 ), ntk.index_to_node( index1 ) ) ? 0 : 1;
         for ( auto& match : field )
           match[0].in_tfi = in_tfi;
-        /* add a TFI dependency */
-        ntk.set_value( ntk.index_to_node( index1 ), index2 );
-        // multi_set_tfi_dependency( ntk.index_to_node( index2 ), ntk.index_to_node( index1 ), cut );
+        /* Propagate the TFI dependency to the cut boundary so DFS cannot temporarily mark an
+           intermediate node before it visits the tuple's upper output. */
+        multi_set_tfi_dependency( ntk.index_to_node( index2 ), ntk.index_to_node( index1 ), cut );
         continue;
       }
 
