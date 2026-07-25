@@ -339,6 +339,35 @@ public:
     return _median_pin_cap;
   }
 
+  /*! \brief Smallest inverter that can legally drive @p load (electrical model): the mapper's
+   * materialized polarity inverters are not matched, so their drive must be chosen against the
+   * signal's real load — a hardcoded smallest inverter on a high-fanout net is exactly the
+   * classic min-size drive violation. Returns the gate id of the smallest inverter whose
+   * max_load covers the load (an undeclared limit counts as unconstrained); when none can, the
+   * one with the largest limit (best illegal — never "no inverter"). Without the electrical
+   * model (or an inverter family), the plain smallest inverter id. */
+  uint32_t select_inverter( float load ) const
+  {
+    if ( _inverters.empty() )
+      return _inv_id;
+    for ( auto const& inv : _inverters )
+    {
+      if ( inv.max_load <= 0.0f || load <= inv.max_load + epsilon )
+        return inv.id;
+    }
+    uint32_t best_id = _inv_id;
+    float best_limit = -1.0f;
+    for ( auto const& inv : _inverters )
+    {
+      if ( inv.max_load > best_limit )
+      {
+        best_limit = inv.max_load;
+        best_id = inv.id;
+      }
+    }
+    return best_id;
+  }
+
   /*! \brief Get buffer information.
    *
    * Returns area, delay, and ID of the smallest buffer.
@@ -419,6 +448,12 @@ private:
               _inv_slope = static_cast<float>( std::max( gate.pins[0].rise_fanout_delay, gate.pins[0].fall_fanout_delay ) );
             }
           }
+          /* electrical model: record the whole inverter drive family for select_inverter */
+          if ( _ps.electrical_model && !gate.pins.empty() )
+          {
+            _inverters.push_back( inverter_drive{ gate.id, static_cast<float>( gate.area ),
+                                                  static_cast<float>( gate.pins[0].max_load ) } );
+          }
         }
         else
         {
@@ -433,6 +468,10 @@ private:
         }
       }
     }
+
+    /* the inverter family, smallest first, so select_inverter's first legal hit is minimal */
+    std::sort( _inverters.begin(), _inverters.end(),
+               []( auto const& a, auto const& b ) { return a.area < b.area; } );
 
     /* median input capacitance (electrical model): the mapper's round-0 load seed */
     if ( _ps.electrical_model )
@@ -1274,6 +1313,13 @@ private:
   float _inv_cap{ 0.0 };
   float _inv_slope{ 0.0 };
   float _median_pin_cap{ 0.0 };
+  struct inverter_drive
+  {
+    uint32_t id;
+    float area;
+    float max_load; /* 0 = undeclared/unconstrained */
+  };
+  std::vector<inverter_drive> _inverters; /* area-ascending; empty without the electrical model */
 
   /* buffer info */
   float _buf_area{ 0.0 };

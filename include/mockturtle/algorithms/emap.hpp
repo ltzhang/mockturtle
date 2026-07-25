@@ -1841,6 +1841,17 @@ private:
     return node_loads[index][phase] <= g->max_load + epsilon;
   }
 
+  /* The binding for a MATERIALIZED polarity inverter on (index, inv_phase)'s signal: under the
+   * electrical model, the smallest inverter drive that legally carries that signal's real load
+   * (tech_library::select_inverter) — a hardcoded smallest inverter on a high-fanout net is the
+   * classic min-size drive violation. Load-blind: the plain smallest inverter. */
+  inline uint32_t select_polarity_inverter( uint32_t index, uint8_t inv_phase ) const
+  {
+    if ( !ps.electrical_model )
+      return lib_inv_id;
+    return library.select_inverter( node_loads[index][inv_phase] );
+  }
+
   void init_node_loads()
   {
     if ( !ps.electrical_model )
@@ -4506,7 +4517,8 @@ private:
         if ( node_data.map_refs[1] > 0 )
         {
           old2new[index][1] = res.create_not( old2new[n][0] );
-          res.add_binding( res.get_node( old2new[index][1] ), lib_inv_id );
+          res.add_binding( res.get_node( old2new[index][1] ),
+                           select_polarity_inverter( index, 1 ) );
         }
         continue;
       }
@@ -4536,7 +4548,8 @@ private:
         if ( node_data.same_match && node_data.map_refs[phase ^ 1] > 0 )
         {
           old2new[index][phase ^ 1] = res.create_not( old2new[index][phase] );
-          res.add_binding( res.get_node( old2new[index][phase ^ 1] ), lib_inv_id );
+          res.add_binding( res.get_node( old2new[index][phase ^ 1] ),
+                           select_polarity_inverter( index, phase ^ 1 ) );
         }
 
         /* count multioutput gates */
