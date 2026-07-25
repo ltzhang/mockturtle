@@ -131,6 +131,17 @@ struct emap_params
   /*! \brief Number of patterns for switching activity computation. */
   uint32_t switching_activity_patterns{ 2048u };
 
+  /*! \brief Electrical (load-aware) cost: price a candidate's pin delay as
+   * block + slope × the capacitive load the CURRENT cover imposes on the node's output, prefer
+   * candidates whose output limit (max_load) covers that load, and refresh the per-node load
+   * estimate from the committed choices after every mapping round. Requires a tech_library built
+   * with tech_library_params::electrical_model (otherwise every slope/cap is 0 and this flag has
+   * no effect). Off: byte-identical mapping. */
+  bool electrical_model{ false };
+
+  /*! \brief Wire capacitance charged per fanout edge in the electrical load estimate. */
+  double wire_cap_per_fanout{ 0.0 };
+
   /*! \brief Compute area-oriented alternative matches */
   bool use_match_alternatives{ true };
 
@@ -807,6 +818,7 @@ public:
     std::memset( node_tuple_match.data(), 0, sizeof( multioutput_info ) * ntk.size() );
     std::tie( lib_inv_area, lib_inv_delay, lib_inv_id ) = library.get_inverter_info();
     std::tie( lib_buf_area, lib_buf_delay, lib_buf_id ) = library.get_buffer_info();
+    std::tie( lib_inv_cap, lib_inv_slope ) = library.get_inverter_electrical();
     tmp_visited.reserve( 100 );
   }
 
@@ -823,6 +835,7 @@ public:
     std::memset( node_tuple_match.data(), 0, sizeof( multioutput_info ) * ntk.size() );
     std::tie( lib_inv_area, lib_inv_delay, lib_inv_id ) = library.get_inverter_info();
     std::tie( lib_buf_area, lib_buf_delay, lib_buf_id ) = library.get_buffer_info();
+    std::tie( lib_inv_cap, lib_inv_slope ) = library.get_inverter_electrical();
     tmp_visited.reserve( 100 );
   }
 
@@ -1733,7 +1746,7 @@ private:
         if ( node_data.map_refs[use_phase ^ 1] > 0 )
         {
           old_required = node_data.required[use_phase];
-          node_data.required[use_phase] = std::min( node_data.required[use_phase], node_data.required[use_phase ^ 1] - lib_inv_delay );
+          node_data.required[use_phase] = std::min( node_data.required[use_phase], node_data.required[use_phase ^ 1] - inv_delay_at( index, use_phase ^ 1 ) );
         }
       }
       else if ( !node_data.map_refs[0] || !node_data.map_refs[1] )
@@ -1799,6 +1812,124 @@ private:
     return true;
   }
 
+  /* --- electrical (load-aware) model ------------------------------------------------------ */
+
+  /* Load-aware pin delay of supergate @p g implementing (index, phase): block + slope × the
+   * load the current cover imposes on that output signal. Exactly g->tdelay[ctr] with the
+   * model off. */
+  inline double gate_delay( supergate<NInputs> const* g, uint32_t ctr, uint32_t index, uint8_t phase ) const
+  {
+    if ( !ps.electrical_model )
+      return g->tdelay[ctr];
+    return g->tdelay[ctr] + g->slope[ctr] * node_loads[index][phase];
+  }
+
+  /* Delay of a polarity inverter whose OUTPUT is (index, inv_phase)'s signal. */
+  inline double inv_delay_at( uint32_t index, uint8_t inv_phase ) const
+  {
+    if ( !ps.electrical_model )
+      return lib_inv_delay;
+    return lib_inv_delay + lib_inv_slope * node_loads[index][inv_phase];
+  }
+
+  /* Can @p g legally drive (index, phase)'s current load? A gate without a declared limit
+   * (max_load 0: no data / unconstrained) is always legal. Trivially true with the model off. */
+  inline bool gate_load_legal( supergate<NInputs> const* g, uint32_t index, uint8_t phase ) const
+  {
+    if ( !ps.electrical_model || g->max_load <= 0.0f )
+      return true;
+    return node_loads[index][phase] <= g->max_load + epsilon;
+  }
+
+  void init_node_loads()
+  {
+    if ( !ps.electrical_model )
+      return;
+    /* round-0 seed: fanout count × the library's median input capacitance — replaced by the
+     * cover's actual pin capacitances after the first round (update_node_loads) */
+    float const seed_cap = library.get_median_pin_cap() + static_cast<float>( ps.wire_cap_per_fanout );
+    node_loads.assign( ntk.size(), { { 0.0f, 0.0f } } );
+    ntk.foreach_node( [&]( auto const& n ) {
+      uint32_t const index = ntk.node_to_index( n );
+      float const load = seed_cap * ntk.fanout_size( n );
+      node_loads[index][0] = node_loads[index][1] = load;
+    } );
+  }
+
+  /* Recompute each signal's load from the cover's committed choices. The traversal mirrors
+   * set_mapping_refs_and_req's counting walk EXACTLY — a cell is present when
+   * `same_match || map_refs[use_phase] > 0` (with same_match a node's references can sit
+   * entirely in the OTHER phase while the cell lives at use_phase, so pairing map_refs[p] with
+   * best_gate[p] would charge nothing on such nodes and silently decay the whole estimate);
+   * with same_match the other phase is served by a materialized inverter whose input
+   * capacitance loads the implemented signal; a negated PI materializes an inverter reading
+   * the PI's positive signal. */
+  void update_node_loads()
+  {
+    if ( !ps.electrical_model )
+      return;
+    float const wire = static_cast<float>( ps.wire_cap_per_fanout );
+    for ( auto& l : node_loads )
+      l[0] = l[1] = 0.0f;
+
+    auto charge_cut = [&]( uint32_t index, uint8_t phase ) {
+      auto const& node_data = node_match[index];
+      supergate<NInputs> const* sg = node_data.best_gate[phase];
+      auto const& best_cut = cuts[index][node_data.best_cut[phase]];
+      uint32_t ctr = 0u;
+      for ( auto leaf : best_cut )
+      {
+        if ( ctr >= NInputs )
+          break;
+        uint8_t const leaf_phase = ( node_data.phase[phase] >> ctr ) & 1;
+        node_loads[leaf][leaf_phase] += sg->cap[ctr] + wire;
+        ++ctr;
+      }
+    };
+
+    for ( auto const& n : topo_order )
+    {
+      uint32_t const index = ntk.node_to_index( n );
+      auto const& node_data = node_match[index];
+
+      if ( ntk.is_constant( n ) )
+        continue;
+      if ( ntk.is_pi( n ) )
+      {
+        if ( node_data.map_refs[1] > 0 )
+          node_loads[index][0] += lib_inv_cap + wire; /* negated PI: an inverter reads the PI */
+        continue;
+      }
+      if constexpr ( has_is_dont_touch_v<Ntk> )
+      {
+        if ( ntk.is_dont_touch( n ) )
+          continue; /* box internals unknown: charge nothing (conservative) */
+      }
+      if ( !node_data.map_refs[0] && !node_data.map_refs[1] )
+        continue;
+
+      uint8_t const use_phase = node_data.best_gate[0] == nullptr ? 1u : 0u;
+      if ( node_data.best_gate[use_phase] == nullptr )
+        continue;
+
+      if ( node_data.same_match || node_data.map_refs[use_phase] > 0 )
+      {
+        charge_cut( index, use_phase );
+        /* one cell serving both polarities: the materialized inverter's input loads the
+         * implemented signal */
+        if ( node_data.same_match && node_data.map_refs[use_phase ^ 1] > 0 )
+          node_loads[index][use_phase] += lib_inv_cap + wire;
+      }
+      if ( !node_data.same_match && node_data.map_refs[use_phase ^ 1] > 0 &&
+           node_data.best_gate[use_phase ^ 1] != nullptr )
+      {
+        charge_cut( index, use_phase ^ 1 );
+      }
+    }
+  }
+
+  /* --- end electrical model --------------------------------------------------------------- */
+
   inline void match_propagate_required( uint32_t index )
   {
     /* don't touch box */
@@ -1834,7 +1965,7 @@ private:
     /* propagate required time over the output inverter if present */
     if ( node_data.same_match && node_data.map_refs[use_phase ^ 1] > 0 )
     {
-      node_data.required[use_phase] = std::min( node_data.required[use_phase], node_data.required[other_phase] - lib_inv_delay );
+      node_data.required[use_phase] = std::min( node_data.required[use_phase], node_data.required[other_phase] - inv_delay_at( index, other_phase ) );
     }
 
     if ( node_data.map_refs[0] )
@@ -1850,7 +1981,7 @@ private:
       for ( auto leaf : best_cut )
       {
         auto phase = ( node_data.phase[use_phase] >> ctr ) & 1;
-        node_match[leaf].required[phase] = std::min( node_match[leaf].required[phase], node_data.required[use_phase] - supergate->tdelay[ctr] );
+        node_match[leaf].required[phase] = std::min( node_match[leaf].required[phase], node_data.required[use_phase] - gate_delay( supergate, ctr, index, use_phase ) );
         ++ctr;
       }
     }
@@ -1863,7 +1994,7 @@ private:
       for ( auto leaf : best_cut )
       {
         auto phase = ( node_data.phase[other_phase] >> ctr ) & 1;
-        node_match[leaf].required[phase] = std::min( node_match[leaf].required[phase], node_data.required[other_phase] - supergate->tdelay[ctr] );
+        node_match[leaf].required[phase] = std::min( node_match[leaf].required[phase], node_data.required[other_phase] - gate_delay( supergate, ctr, index, other_phase ) );
         ++ctr;
       }
     }
@@ -1999,6 +2130,8 @@ private:
       }
     }
 
+    /* refresh the electrical load estimate from this round's committed cover */
+    update_node_loads();
     ++iteration;
 
     if constexpr ( ELA )
@@ -2165,6 +2298,8 @@ private:
       }
     }
 
+    /* refresh the electrical load estimate from this round's committed cover */
+    update_node_loads();
     ++iteration;
 
     if constexpr ( ELA )
@@ -2359,7 +2494,7 @@ private:
       auto ctr = 0u;
       for ( auto l : cuts[index][node_data.best_cut[use_phase]] )
       {
-        double arrival_pin = node_match[l].arrival[( best_phase >> ctr ) & 1] + best_gate->tdelay[ctr];
+        double arrival_pin = node_match[l].arrival[( best_phase >> ctr ) & 1] + gate_delay( best_gate, ctr, index, use_phase );
         worst_arrival = std::max( worst_arrival, arrival_pin );
         ++ctr;
       }
@@ -2381,7 +2516,7 @@ private:
       use_phase ^= 1;
       if ( node_data.same_match )
       {
-        node_data.arrival[use_phase] = worst_arrival + lib_inv_delay;
+        node_data.arrival[use_phase] = worst_arrival + inv_delay_at( index, use_phase );
         continue;
       }
 
@@ -2393,7 +2528,7 @@ private:
       ctr = 0u;
       for ( auto l : cuts[index][node_data.best_cut[use_phase]] )
       {
-        double arrival_pin = node_match[l].arrival[( best_phase >> ctr ) & 1] + best_gate->tdelay[ctr];
+        double arrival_pin = node_match[l].arrival[( best_phase >> ctr ) & 1] + gate_delay( best_gate, ctr, index, use_phase );
         worst_arrival = std::max( worst_arrival, arrival_pin );
         ++ctr;
       }
@@ -2416,6 +2551,9 @@ private:
       else
         delay = std::max( delay, node_match[index].arrival[0] );
     } );
+
+    /* refresh the electrical load estimate from this round's committed cover */
+    update_node_loads();
 
     /* return if mapping is area oriented */
     ++iteration;
@@ -2445,7 +2583,7 @@ private:
     auto ctr = 0u;
     for ( auto l : cuts[index][node_data.best_cut[use_phase]] )
     {
-      double arrival_pin = node_match[l].arrival[( best_phase >> ctr ) & 1] + best_gate->tdelay[ctr];
+      double arrival_pin = node_match[l].arrival[( best_phase >> ctr ) & 1] + gate_delay( best_gate, ctr, index, use_phase );
       worst_arrival = std::max( worst_arrival, arrival_pin );
       ++ctr;
     }
@@ -2455,7 +2593,7 @@ private:
     use_phase ^= 1;
     if ( node_data.same_match )
     {
-      node_data.arrival[use_phase] = worst_arrival + lib_inv_delay;
+      node_data.arrival[use_phase] = worst_arrival + inv_delay_at( index, use_phase );
       return;
     }
 
@@ -2467,7 +2605,7 @@ private:
     ctr = 0u;
     for ( auto l : cuts[index][node_data.best_cut[use_phase]] )
     {
-      double arrival_pin = node_match[l].arrival[( best_phase >> ctr ) & 1] + best_gate->tdelay[ctr];
+      double arrival_pin = node_match[l].arrival[( best_phase >> ctr ) & 1] + gate_delay( best_gate, ctr, index, use_phase );
       worst_arrival = std::max( worst_arrival, arrival_pin );
       ++ctr;
     }
@@ -2493,6 +2631,10 @@ private:
     gA.arrival = std::numeric_limits<float>::max();
     gA.flow = std::numeric_limits<float>::max();
     uint32_t best_sizeA = UINT32_MAX;
+    /* electrical model: whether the current best can legally drive this signal's load (the
+     * alternative gA keeps the pure cost comparison — it competes under required-time checks
+     * downstream, and its arrival already carries the load term) */
+    bool best_legal = false;
 
     /* unmap multioutput */
     node_data.multioutput_match[phase] = false;
@@ -2530,7 +2672,7 @@ private:
         {
           uint8_t leaf_phase = ( gate_polarity >> ctr ) & 1;
 
-          double arrival_pinA = node_match[l].best_alternative[leaf_phase].arrival + gate.tdelay[ctr];
+          double arrival_pinA = node_match[l].best_alternative[leaf_phase].arrival + gate_delay( &gate, ctr, index, phase );
           worst_arrivalA = std::max( worst_arrivalA, arrival_pinA );
 
           // if constexpr ( DO_AREA )
@@ -2539,7 +2681,7 @@ private:
           //     break;
           // }
 
-          double arrival_pin = node_match[l].arrival[leaf_phase] + gate.tdelay[ctr];
+          double arrival_pin = node_match[l].arrival[leaf_phase] + gate_delay( &gate, ctr, index, phase );
           worst_arrival = std::max( worst_arrival, arrival_pin );
 
           area_local += node_match[l].flows[leaf_phase];
@@ -2556,7 +2698,16 @@ private:
             skip = true;
         }
 
-        if ( !skip && compare_map<DO_AREA>( worst_arrival, node_data.arrival[phase], area_local, node_data.flows[phase], cut->size(), best_size ) )
+        /* electrical model: a drive that can legally carry the signal's load outranks one
+         * that cannot; among equals the usual cost comparison decides. Inert with the model
+         * off (every candidate is trivially legal, so pick == compare_map). */
+        bool pick;
+        bool const cand_legal = gate_load_legal( &gate, index, phase );
+        if ( ps.electrical_model && cand_legal != best_legal )
+          pick = cand_legal;
+        else
+          pick = compare_map<DO_AREA>( worst_arrival, node_data.arrival[phase], area_local, node_data.flows[phase], cut->size(), best_size );
+        if ( !skip && pick )
         {
           node_data.best_gate[phase] = &gate;
           node_data.arrival[phase] = worst_arrival;
@@ -2565,6 +2716,7 @@ private:
           node_data.area[phase] = gate.area;
           node_data.phase[phase] = gate_polarity;
           best_size = cut->size();
+          best_legal = cand_legal;
         }
 
         /* compute the alternative */
@@ -2652,7 +2804,7 @@ private:
         for ( auto l : *cut )
         {
           uint8_t leaf_phase = ( gate_polarity >> ctr ) & 1;
-          worst_arrival = std::max( worst_arrival, node_match[l].arrival[leaf_phase] + gate.tdelay[ctr] );
+          worst_arrival = std::max( worst_arrival, node_match[l].arrival[leaf_phase] + gate_delay( &gate, ctr, index, phase ) );
           if constexpr ( !ExactArea )
             flow += node_match[l].flows[leaf_phase];
           ++ctr;
@@ -2704,6 +2856,7 @@ private:
     uint8_t best_cut = 0u;
     uint16_t best_phase = 0u;
     uint8_t cut_index = 0u;
+    bool best_legal = false;
     auto index = ntk.node_to_index( n );
 
     auto& node_data = node_match[index];
@@ -2765,7 +2918,7 @@ private:
         auto ctr = 0u;
         for ( auto l : *cut )
         {
-          double arrival_pin = node_match[l].arrival[( gate_polarity >> ctr ) & 1] + gate.tdelay[ctr];
+          double arrival_pin = node_match[l].arrival[( gate_polarity >> ctr ) & 1] + gate_delay( &gate, ctr, index, phase );
           worst_arrival = std::max( worst_arrival, arrival_pin );
           ++ctr;
         }
@@ -2777,7 +2930,14 @@ private:
         node_data.area[phase] = gate.area;
         float area_exact = cut_measure_mffc<SwitchActivity>( *cut, n, phase );
 
-        if ( compare_map<true>( worst_arrival, best_arrival, area_exact, best_exact_area, cut->size(), best_size ) )
+        /* electrical model: legal-drive preference (see match_phase) */
+        bool pick;
+        bool const cand_legal = gate_load_legal( &gate, index, phase );
+        if ( ps.electrical_model && cand_legal != best_legal )
+          pick = cand_legal;
+        else
+          pick = compare_map<true>( worst_arrival, best_arrival, area_exact, best_exact_area, cut->size(), best_size );
+        if ( pick )
         {
           best_arrival = worst_arrival;
           best_exact_area = area_exact;
@@ -2786,6 +2946,7 @@ private:
           best_cut = cut_index;
           best_phase = gate_polarity;
           best_gate = &gate;
+          best_legal = cand_legal;
         }
       }
 
@@ -2827,8 +2988,8 @@ private:
     auto& node_data = node_match[index];
 
     /* compute arrival adding an inverter to the other match phase */
-    double worst_arrival_npos = node_data.arrival[1] + lib_inv_delay;
-    double worst_arrival_nneg = node_data.arrival[0] + lib_inv_delay;
+    double worst_arrival_npos = node_data.arrival[1] + inv_delay_at( index, 0 );
+    double worst_arrival_nneg = node_data.arrival[0] + inv_delay_at( index, 1 );
     bool use_zero = false;
     bool use_one = false;
 
@@ -2895,12 +3056,12 @@ private:
           use_zero = true;
         }
         /* select the not used match instead if it leads to area improvement and doesn't violate the required time */
-        if ( node_data.arrival[nphase] + lib_inv_delay < node_data.required[phase] + epsilon )
+        if ( node_data.arrival[nphase] + inv_delay_at( index, phase ) < node_data.required[phase] + epsilon )
         {
           auto size_phase = cuts[index][node_data.best_cut[phase]].size();
           auto size_nphase = cuts[index][node_data.best_cut[nphase]].size();
 
-          if ( compare_map<DO_AREA>( node_data.arrival[nphase] + lib_inv_delay, node_data.arrival[phase], node_data.flows[nphase] + lib_inv_area, node_data.flows[phase], size_nphase, size_phase ) )
+          if ( compare_map<DO_AREA>( node_data.arrival[nphase] + inv_delay_at( index, phase ), node_data.arrival[phase], node_data.flows[nphase] + lib_inv_area, node_data.flows[phase], size_nphase, size_phase ) )
           {
             /* invert the choice */
             use_zero = !use_zero;
@@ -3055,7 +3216,7 @@ private:
     {
       g1 = g0;
       g1.gate = nullptr;
-      g1.arrival += lib_inv_delay;
+      g1.arrival += inv_delay_at( index, 1 );
       g1.flow = ( g1.flow + lib_inv_area ) / node_data.est_refs[1];
       g0.flow = g0flow;
       return;
@@ -3064,7 +3225,7 @@ private:
     {
       g0 = g1;
       g0.gate = nullptr;
-      g0.arrival += lib_inv_delay;
+      g0.arrival += inv_delay_at( index, 0 );
       g0.flow = ( g0.flow + lib_inv_area ) / node_data.est_refs[0];
       g1.flow = g1flow;
       return;
@@ -3103,7 +3264,7 @@ private:
         else
         {
           best_gate_emap<NInputs>& gUse = node_data.best_alternative[use_phase];
-          if ( gUse.arrival > node_data.required[use_phase] + epsilon || gUse.arrival + lib_inv_delay > node_data.required[use_phase ^ 1] + epsilon )
+          if ( gUse.arrival > node_data.required[use_phase] + epsilon || gUse.arrival + inv_delay_at( index, use_phase ^ 1 ) > node_data.required[use_phase ^ 1] + epsilon )
           {
             return;
           }
@@ -3117,12 +3278,12 @@ private:
         if ( g0.gate != nullptr && g0.arrival < node_data.required[0] + epsilon )
         {
           node_data.same_match = false;
-          refine_best_matches_copy_refinement( n, 0, g1.gate == nullptr && g0.arrival + lib_inv_delay < node_data.required[1] + epsilon );
+          refine_best_matches_copy_refinement( n, 0, g1.gate == nullptr && g0.arrival + inv_delay_at( index, 1 ) < node_data.required[1] + epsilon );
         }
         if ( g1.gate != nullptr && g1.arrival < node_data.required[1] + epsilon )
         {
           node_data.same_match = false;
-          refine_best_matches_copy_refinement( n, 1, g0.gate == nullptr && g1.arrival + lib_inv_delay < node_data.required[0] + epsilon );
+          refine_best_matches_copy_refinement( n, 1, g0.gate == nullptr && g1.arrival + inv_delay_at( index, 0 ) < node_data.required[0] + epsilon );
         }
       }
     }
@@ -3133,7 +3294,7 @@ private:
         node_data.same_match = false;
         refine_best_matches_copy_refinement( n, 0, false );
       }
-      else if ( g0.gate == nullptr && g1.arrival + lib_inv_delay < node_data.required[0] + epsilon )
+      else if ( g0.gate == nullptr && g1.arrival + inv_delay_at( index, 0 ) < node_data.required[0] + epsilon )
       {
         refine_best_matches_copy_refinement( n, 1, true );
       }
@@ -3145,7 +3306,7 @@ private:
         node_data.same_match = false;
         refine_best_matches_copy_refinement( n, 1, false );
       }
-      else if ( g1.gate == nullptr && g0.arrival + lib_inv_delay < node_data.required[1] + epsilon )
+      else if ( g1.gate == nullptr && g0.arrival + inv_delay_at( index, 1 ) < node_data.required[1] + epsilon )
       {
         refine_best_matches_copy_refinement( n, 0, true );
       }
@@ -3173,7 +3334,7 @@ private:
     node_data.best_gate[phase] = nullptr;
     node_data.phase[phase] = bg.phase;
     node_data.best_cut[phase] = bg.cut;
-    node_data.arrival[phase] = bg.arrival + lib_inv_delay;
+    node_data.arrival[phase] = bg.arrival + inv_delay_at( index, phase );
     node_data.area[phase] = bg.area;
     node_data.flows[phase] = ( bg.flow * node_data.est_refs[phase ^ 1] + lib_inv_area ) / node_data.est_refs[phase];
   }
@@ -4294,12 +4455,16 @@ private:
       return false;
     }
 
+    /* seed the electrical load estimate before any arrival uses it (no-op with the model off) */
+    init_node_loads();
+
     if ( ps.arrival_times.empty() )
     {
       ntk.foreach_pi( [&]( auto const& n ) {
-        auto& node_data = node_match[ntk.node_to_index( n )];
+        uint32_t const index = ntk.node_to_index( n );
+        auto& node_data = node_match[index];
         node_data.arrival[0] = node_data.best_alternative[0].arrival = 0;
-        node_data.arrival[1] = node_data.best_alternative[1].arrival = lib_inv_delay;
+        node_data.arrival[1] = node_data.best_alternative[1].arrival = inv_delay_at( index, 1 );
       } );
       return true;
     }
@@ -4312,9 +4477,10 @@ private:
     }
 
     ntk.foreach_pi( [&]( auto const& n, uint32_t i ) {
-      auto& node_data = node_match[ntk.node_to_index( n )];
+      uint32_t const index = ntk.node_to_index( n );
+      auto& node_data = node_match[index];
       node_data.arrival[0] = node_data.best_alternative[0].arrival = ps.arrival_times[i];
-      node_data.arrival[1] = node_data.best_alternative[1].arrival = ps.arrival_times[i] + lib_inv_delay;
+      node_data.arrival[1] = node_data.best_alternative[1].arrival = ps.arrival_times[i] + inv_delay_at( index, 1 );
     } );
 
     return true;
@@ -5847,6 +6013,14 @@ private:
   float lib_inv_area;
   float lib_inv_delay;
   uint32_t lib_inv_id;
+
+  /* electrical (load-aware) model: the smallest inverter's input capacitance and delay slope,
+   * and the per-(node, phase) capacitive load the current cover imposes on each signal. The
+   * loads are seeded from fanout counts (init_node_loads) and refreshed from the committed
+   * cover after every round (update_node_loads). All zero unless ps.electrical_model. */
+  float lib_inv_cap{ 0 };
+  float lib_inv_slope{ 0 };
+  std::vector<std::array<float, 2>> node_loads;
 
   /* lib buffer info */
   float lib_buf_area;
