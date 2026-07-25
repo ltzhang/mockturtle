@@ -1156,7 +1156,9 @@ private:
     if ( !_ps.electrical_model || g.is_super || g.root == nullptr )
       return;
     auto const& pins = g.root->pins;
-    if ( pins.size() < g.num_vars )
+    /* a 0-input gate (tie/constant cell) has NO pins — pins[0] below would deref an empty
+     * vector; it also has no electrical model to fill (nothing drives it) */
+    if ( pins.empty() || pins.size() < g.num_vars )
       return;
     for ( auto i = 0u; i < sg.permutation.size() && i < NInputs; ++i )
     {
