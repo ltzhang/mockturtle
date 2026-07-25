@@ -124,6 +124,14 @@ struct tech_library_params
    * max_load for a load-aware mapper cost. Off: byte-identical library to before. */
   bool electrical_model{ false };
 
+  /*! \brief Bound on admitted drive variants per function under the electrical model (rule of
+   * bounded resources: NP enumeration is per gate, so an unbounded family multiplies matching
+   * cost). When a function has more non-dominated variants than this, the Pareto EXTREMES — the
+   * smallest-area variant and the smallest-total-slope (strongest-drive) variant — are always
+   * kept and interior points are dropped, reported under `verbose` (a silent truncation would
+   * read as "the whole family was considered"). 0 = unbounded. */
+  uint32_t max_drives_per_function{ 8u };
+
   /*! \brief Loads multioutput gates in single-output library */
   bool load_multioutput_gates_single{ false };
 
@@ -346,6 +354,26 @@ public:
    * max_load covers the load (an undeclared limit counts as unconstrained); when none can, the
    * one with the largest limit (best illegal — never "no inverter"). Without the electrical
    * model (or an inverter family), the plain smallest inverter id. */
+  /*! \brief Input capacitance of inverter drive @p id (select_inverter's return), falling back
+   * to the smallest inverter's — so a caller charging the SELECTED inverter's real load on its
+   * driver has the number, not a guess. */
+  float inverter_input_load( uint32_t id ) const
+  {
+    for ( auto const& inv : _inverters )
+      if ( inv.id == id )
+        return inv.cap;
+    return _inv_cap;
+  }
+
+  /*! \brief Drive limit of inverter drive @p id (0 = undeclared/unconstrained). */
+  float inverter_max_load( uint32_t id ) const
+  {
+    for ( auto const& inv : _inverters )
+      if ( inv.id == id )
+        return inv.max_load;
+    return 0.0f;
+  }
+
   uint32_t select_inverter( float load ) const
   {
     if ( _inverters.empty() )
@@ -452,7 +480,8 @@ private:
           if ( _ps.electrical_model && !gate.pins.empty() )
           {
             _inverters.push_back( inverter_drive{ gate.id, static_cast<float>( gate.area ),
-                                                  static_cast<float>( gate.pins[0].max_load ) } );
+                                                  static_cast<float>( gate.pins[0].max_load ),
+                                                  static_cast<float>( gate.pins[0].input_load ) } );
           }
         }
         else
@@ -1303,6 +1332,107 @@ private:
         }
       }
     }
+
+    if ( _ps.electrical_model && _ps.max_drives_per_function > 0 )
+    {
+      bound_drives_per_function( supergates, skip_gates );
+    }
+  }
+
+  /* Bound the surviving drive variants per function (electrical model): when a function has more
+   * non-dominated variants than `max_drives_per_function`, keep the Pareto EXTREMES — the
+   * smallest-area variant and the smallest-total-slope (strongest-drive) variant — and drop
+   * interior points, since the extremes are what bracket the achievable area/drive trade. Reports
+   * what it dropped under `verbose`: a silent truncation would read as "the whole family was
+   * considered". */
+  void bound_drives_per_function( std::deque<composed_gate<NInputs>> const& supergates,
+                                  std::vector<bool>& skip_gates )
+  {
+    std::vector<uint32_t> group;
+    std::vector<bool> grouped( skip_gates.size(), false );
+    uint32_t dropped = 0;
+
+    for ( uint32_t i = 0; i < skip_gates.size(); ++i )
+    {
+      if ( skip_gates[i] || grouped[i] || supergates[i].root == nullptr )
+        continue;
+
+      group.clear();
+      group.push_back( i );
+      grouped[i] = true;
+      for ( uint32_t j = i + 1; j < skip_gates.size(); ++j )
+      {
+        if ( skip_gates[j] || grouped[j] || supergates[j].root == nullptr )
+          continue;
+        if ( supergates[j].function != supergates[i].function )
+          continue;
+        group.push_back( j );
+        grouped[j] = true;
+      }
+
+      if ( group.size() <= _ps.max_drives_per_function )
+        continue;
+
+      auto total_slope = [&]( uint32_t idx ) {
+        float t = 0.0f;
+        for ( uint32_t k = 0; k < supergates[idx].num_vars && k < NInputs; ++k )
+          t += pin_slope( supergates[idx], k );
+        return t;
+      };
+
+      /* the two extremes bracket the achievable area/drive trade, so they are RESERVED before the
+       * budget is spent — a bound that dropped the strongest drive would defeat the whole purpose */
+      uint32_t smallest_area = group[0], smallest_slope = group[0];
+      for ( uint32_t idx : group )
+      {
+        if ( supergates[idx].area < supergates[smallest_area].area )
+          smallest_area = idx;
+        if ( total_slope( idx ) < total_slope( smallest_slope ) )
+          smallest_slope = idx;
+      }
+
+      /* ascending area, index-ordered on a tie: the bound must be reproducible run to run */
+      std::sort( group.begin(), group.end(), [&]( uint32_t x, uint32_t y ) {
+        if ( supergates[x].area != supergates[y].area )
+          return supergates[x].area < supergates[y].area;
+        return x < y;
+      } );
+
+      /* the budget never drops below the two extremes: a cap of 1 with two distinct extremes keeps
+       * both, since bracketing the trade matters more than the exact cap */
+      const uint32_t budget = std::max( _ps.max_drives_per_function, 2u );
+      std::vector<bool> keep( group.size(), false );
+      uint32_t kept = 0;
+      for ( uint32_t g = 0; g < group.size(); ++g )
+      {
+        if ( group[g] == smallest_area || group[g] == smallest_slope )
+        {
+          keep[g] = true;
+          ++kept;
+        }
+      }
+      for ( uint32_t g = 0; g < group.size() && kept < budget; ++g )
+      {
+        if ( keep[g] )
+          continue;
+        keep[g] = true;
+        ++kept;
+      }
+      for ( uint32_t g = 0; g < group.size(); ++g )
+      {
+        if ( keep[g] )
+          continue;
+        skip_gates[group[g]] = true;
+        ++dropped;
+      }
+    }
+
+    if ( dropped > 0 && _ps.verbose )
+    {
+      std::cout << fmt::format( "[i] load-aware library: dropped {} interior drive variant(s) to the "
+                                "per-function bound of {} (Pareto extremes kept)\n",
+                                dropped, _ps.max_drives_per_function );
+    }
   }
 
 private:
@@ -1320,6 +1450,7 @@ private:
     uint32_t id;
     float area;
     float max_load; /* 0 = undeclared/unconstrained */
+    float cap;      /* input capacitance this drive presents to whatever feeds it */
   };
   std::vector<inverter_drive> _inverters; /* area-ascending; empty without the electrical model */
 

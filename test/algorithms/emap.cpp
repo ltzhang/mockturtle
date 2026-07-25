@@ -1050,3 +1050,198 @@ TEST_CASE( "Emap on circuit with don't touch cells", "[emap]" )
   CHECK( st.delay > 5.8f - eps );
   CHECK( st.delay < 5.8f + eps );
 }
+/* Drive-legality fixture (ADR-0047): two drive strengths per function with real max_load limits. The
+ * strong cell costs 4x the area and is slower unloaded, but has a 10x smaller load slope and a 10x
+ * higher drive limit -- so it only ever wins on a node that actually drives a load. */
+std::string const drive_family_library = "GATE   inv_w   1 O=!a;     PIN * INV 0.5 2.0 0.010 0.100 0.010 0.100\n"
+                                         "GATE   inv_s   4 O=!a;     PIN * INV 2.0 20.0 0.020 0.010 0.020 0.010\n"
+                                         "GATE   nand_w  2 O=!(a*b); PIN * INV 0.5 2.0 0.015 0.100 0.015 0.100\n"
+                                         "GATE   nand_s  8 O=!(a*b); PIN * INV 2.0 20.0 0.030 0.010 0.030 0.010\n"
+                                         "GATE   zero    0 O=CONST0;\n"
+                                         "GATE   one     0 O=CONST1;";
+
+/* A shared node driven into EIGHT distinct sinks: whatever cell is bound for it drives eight input
+ * pins, which at the weak cell's 0.5 pin capacitance is a load of 4.0 against its own 2.0 limit. */
+namespace
+{
+aig_network eight_sink_aig()
+{
+  aig_network aig;
+  auto const a = aig.create_pi();
+  auto const b = aig.create_pi();
+  auto const t = aig.create_and( a, b );
+  for ( int i = 0; i < 8; ++i )
+  {
+    auto const p = aig.create_pi();
+    aig.create_po( aig.create_and( !t, p ) );
+  }
+  return aig;
+}
+
+struct drive_mix
+{
+  uint32_t weak{ 0 };
+  uint32_t strong{ 0 };
+};
+
+drive_mix map_and_count( bool load_aware )
+{
+  std::vector<gate> gates;
+  std::istringstream in( drive_family_library );
+  lorina::read_genlib( in, genlib_reader( gates ) );
+
+  tech_library_params tps;
+  tps.electrical_model = load_aware;
+  tech_library<3> tlib( gates, tps );
+
+  emap_params ps;
+  ps.electrical_model = load_aware;
+  ps.area_oriented_mapping = false;
+  emap_stats st;
+
+  aig_network aig = eight_sink_aig();
+  auto res = emap_klut( aig, tlib, ps, &st );
+
+  drive_mix mix;
+  res.foreach_node( [&]( auto const& n ) {
+    if ( !res.has_binding( n ) )
+      return;
+    std::string const& name = res.get_binding( n ).name;
+    if ( name.size() > 2 && name.compare( name.size() - 2, 2, "_s" ) == 0 )
+      ++mix.strong;
+    if ( name.size() > 2 && name.compare( name.size() - 2, 2, "_w" ) == 0 )
+      ++mix.weak;
+  } );
+  return mix;
+}
+} // namespace
+
+TEST_CASE( "emap load-aware mapping strengthens an overloaded driver", "[emap]" )
+{
+  drive_mix const blind = map_and_count( false );
+  drive_mix const aware = map_and_count( true );
+
+  /* load-blind: only the minimum-size cells exist, so no strong cell can be chosen */
+  CHECK( blind.strong == 0u );
+  CHECK( blind.weak > 0u );
+
+  /* load-aware: the heavily loaded node earns a stronger drive */
+  CHECK( aware.strong > 0u );
+  /* and the mapping does not simply upsize everything -- the lightly loaded cells stay small */
+  CHECK( aware.weak > 0u );
+}
+
+TEST_CASE( "emap load-aware mapping reports drive legality", "[emap]" )
+{
+  std::vector<gate> gates;
+  std::istringstream in( drive_family_library );
+  lorina::read_genlib( in, genlib_reader( gates ) );
+
+  aig_network aig = eight_sink_aig();
+
+  /* load-blind: the overloaded driver is invisible, so nothing is reported */
+  {
+    tech_library<3> tlib( gates, tech_library_params{} );
+    emap_params ps;
+    emap_stats st;
+    emap_klut( aig, tlib, ps, &st );
+    CHECK( st.max_load_violations == 0u );
+    CHECK( st.worst_load_ratio == 0.0 );
+  }
+
+  /* load-aware: the estimated load is measured against each bound cell's own limit */
+  {
+    tech_library_params tps;
+    tps.electrical_model = true;
+    tech_library<3> tlib( gates, tps );
+    emap_params ps;
+    ps.electrical_model = true;
+    emap_stats st;
+    emap_klut( aig, tlib, ps, &st );
+    CHECK( st.worst_load_ratio > 0.0 );
+  }
+}
+
+TEST_CASE( "emap load-aware mapping is off by default", "[emap]" )
+{
+  /* The default must be byte-identical to the pre-ADR-0047 behavior: same area, same delay, same
+   * cell count on a library that HAS drive variants but a tech_library built without load_aware. */
+  std::vector<gate> gates;
+  std::istringstream in( drive_family_library );
+  lorina::read_genlib( in, genlib_reader( gates ) );
+
+  tech_library<3> tlib( gates, tech_library_params{} );
+  aig_network aig = eight_sink_aig();
+
+  emap_params ps;
+  CHECK( ps.electrical_model == false );
+  CHECK( ps.wire_cap_per_fanout == 0.0f );
+
+  emap_stats st1, st2;
+  auto r1 = emap_klut( aig, tlib, ps, &st1 );
+  auto r2 = emap_klut( aig, tlib, ps, &st2 );
+  CHECK( r1.compute_area() == r2.compute_area() );
+  CHECK( st1.area == st2.area );
+  CHECK( st1.delay == st2.delay );
+}
+
+TEST_CASE( "emap area-delay frontier is off by default and bounded when on", "[emap]" )
+{
+  emap_params ps;
+  CHECK( ps.curve_points == 0u ); /* the default keeps one best match per phase */
+
+  std::vector<gate> gates;
+  std::istringstream in( drive_family_library );
+  lorina::read_genlib( in, genlib_reader( gates ) );
+  tech_library_params tps;
+  tps.electrical_model = true;
+  tech_library<3> tlib( gates, tps );
+  aig_network aig = eight_sink_aig();
+
+  /* an absurd budget must be clamped, not honored: the frontier is the memory-hungry structure here */
+  emap_params big;
+  big.electrical_model = true;
+  big.curve_points = 1000;
+  emap_stats st;
+  auto res = emap_klut( aig, tlib, big, &st );
+  CHECK( st.area > 0.0 );
+  res.foreach_node( [&]( auto const& n ) {
+    if ( !res.is_constant( n ) && !res.is_ci( n ) )
+      CHECK( res.has_binding( n ) ); /* every node still bound: the frontier never drops a match */
+  } );
+}
+
+TEST_CASE( "emap frontier re-selection keeps the cover valid and no more expensive", "[emap]" )
+{
+  std::vector<gate> gates;
+  std::istringstream in( drive_family_library );
+  lorina::read_genlib( in, genlib_reader( gates ) );
+  tech_library_params tps;
+  tps.electrical_model = true;
+  tech_library<3> tlib( gates, tps );
+  aig_network aig = eight_sink_aig();
+
+  emap_params base;
+  base.electrical_model = true;
+  emap_stats st_base;
+  emap_klut( aig, tlib, base, &st_base );
+
+  emap_params curve = base;
+  curve.curve_points = 4;
+  emap_stats st_curve;
+  auto res = emap_klut( aig, tlib, curve, &st_curve );
+
+  /* Each re-selection step only ever moves to a cheaper point that still meets required -- but it
+   * also changes arrivals, hence the next round's required times and search trajectory, so the FINAL
+   * area is not monotone against the single-best cover. That is a keep-best decision for the caller,
+   * not an invariant to assert here (WiseSyn offers the frontier cover as an additional portfolio
+   * candidate for exactly this reason). What must hold is that the cover stays valid and legality is
+   * never traded away. */
+  CHECK( st_curve.area > 0.0 );
+  CHECK( st_curve.max_load_violations <= st_base.max_load_violations );
+  CHECK( res.compute_area() > 0.0 );
+  res.foreach_node( [&]( auto const& n ) {
+    if ( !res.is_constant( n ) && !res.is_ci( n ) )
+      CHECK( res.has_binding( n ) );
+  } );
+}

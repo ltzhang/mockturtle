@@ -1114,4 +1114,168 @@ TEST_CASE( "Complete library generation", "[tech_library]" )
 
     kitty::exact_np_enumeration( tt, test_enumeration );
   }
+}std::string const drive_family_library = "GATE   inv_w   1 O=!a;     PIN * INV 0.5 2.0 0.010 0.100 0.010 0.100\n"
+                                         "GATE   inv_s   4 O=!a;     PIN * INV 2.0 20.0 0.020 0.010 0.020 0.010\n"
+                                         "GATE   nand_w  2 O=!(a*b); PIN * INV 0.5 2.0 0.015 0.100 0.015 0.100\n"
+                                         "GATE   nand_s  8 O=!(a*b); PIN * INV 2.0 20.0 0.030 0.010 0.030 0.010\n"
+                                         "GATE   zero    0 O=CONST0;\n"
+                                         "GATE   one     0 O=CONST1;";
+
+TEST_CASE( "tech library carries pin capacitance, load slope, and drive limit", "[tech_library]" )
+{
+  std::vector<gate> gates;
+  std::istringstream in( drive_family_library );
+  CHECK( lorina::read_genlib( in, genlib_reader( gates ) ) == lorina::return_code::success );
+
+  tech_library_params ps;
+  ps.electrical_model = true;
+  tech_library<2> lib( gates, ps );
+
+  kitty::static_truth_table<2> tt;
+  kitty::create_from_hex_string( tt, "7" ); /* NAND2 */
+  auto const* sgs = lib.get_supergates( kitty::extend_to<6>( tt ) );
+  REQUIRE( sgs != nullptr );
+
+  /* Both drive strengths must reach matching: the strong cell is NOT dominated once the load slope
+   * is part of the comparison. */
+  CHECK( sgs->size() == 2u );
+
+  bool saw_weak = false, saw_strong = false;
+  for ( auto const& sg : *sgs )
+  {
+    CHECK( sg.cap[0] > 0.0f );
+    CHECK( sg.slope[0] > 0.0f );
+    CHECK( sg.max_load > 0.0f );
+    if ( sg.root->root->name == "nand_w" )
+    {
+      saw_weak = true;
+      CHECK( sg.cap[0] == 0.5f );
+      CHECK( sg.slope[0] == 0.100f );
+      CHECK( sg.max_load == 2.0f );
+      CHECK( sg.tdelay[0] == 0.015f );
+    }
+    if ( sg.root->root->name == "nand_s" )
+    {
+      saw_strong = true;
+      CHECK( sg.cap[0] == 2.0f );
+      CHECK( sg.slope[0] == 0.010f );
+      CHECK( sg.max_load == 20.0f );
+      CHECK( sg.tdelay[0] == 0.030f );
+    }
+  }
+  CHECK( saw_weak );
+  CHECK( saw_strong );
+
+  /* The inverter's input capacitance is the library's natural unit of load, alongside the area and
+   * delay the inverter already provides. */
+  CHECK( lib.get_inverter_electrical().first == 0.5f );
+}
+
+TEST_CASE( "tech library keeps minimum size only by default", "[tech_library]" )
+{
+  /* The default is unchanged: with load_aware off, the strong cell of each function is dominated at
+   * zero load and discarded before matching, exactly as before ADR-0047. */
+  std::vector<gate> gates;
+  std::istringstream in( drive_family_library );
+  CHECK( lorina::read_genlib( in, genlib_reader( gates ) ) == lorina::return_code::success );
+
+  tech_library<2> lib( gates, tech_library_params{} );
+
+  kitty::static_truth_table<2> tt;
+  kitty::create_from_hex_string( tt, "7" );
+  auto const* sgs = lib.get_supergates( kitty::extend_to<6>( tt ) );
+  REQUIRE( sgs != nullptr );
+  CHECK( sgs->size() == 1u );
+  CHECK( ( *sgs )[0].root->root->name == "nand_w" );
+}
+
+TEST_CASE( "load-aware dominance still prunes a cell that is worse at every load", "[tech_library]" )
+{
+  /* nand_bad is larger in area AND slower in both the block term and the slope, so it is worse at
+   * every load and must still be pruned -- the filter is a generalization of zero-load dominance,
+   * not a disabling of it. */
+  std::string const with_useless = std::string( drive_family_library ) +
+                                   "\nGATE   nand_bad 9 O=!(a*b); PIN * INV 2.0 20.0 0.040 0.200 0.040 0.200";
+  std::vector<gate> gates;
+  std::istringstream in( with_useless );
+  CHECK( lorina::read_genlib( in, genlib_reader( gates ) ) == lorina::return_code::success );
+
+  tech_library_params ps;
+  ps.electrical_model = true;
+  tech_library<2> lib( gates, ps );
+
+  kitty::static_truth_table<2> tt;
+  kitty::create_from_hex_string( tt, "7" );
+  auto const* sgs = lib.get_supergates( kitty::extend_to<6>( tt ) );
+  REQUIRE( sgs != nullptr );
+  CHECK( sgs->size() == 2u );
+  for ( auto const& sg : *sgs )
+    CHECK( sg.root->root->name != "nand_bad" );
+}
+
+TEST_CASE( "load-aware drive admission is bounded per function", "[tech_library]" )
+{
+  /* Five non-dominated inverter drives, capped to three: the bound must hold and it must keep the
+   * Pareto EXTREMES (the smallest area and the smallest slope), never an arbitrary prefix. */
+  std::string const many_drives = "GATE inv1 1 O=!a; PIN * INV 0.5 2.0  0.010 0.100 0.010 0.100\n"
+                                  "GATE inv2 2 O=!a; PIN * INV 1.0 4.0  0.012 0.070 0.012 0.070\n"
+                                  "GATE inv3 3 O=!a; PIN * INV 1.5 8.0  0.014 0.050 0.014 0.050\n"
+                                  "GATE inv4 4 O=!a; PIN * INV 2.0 12.0 0.016 0.030 0.016 0.030\n"
+                                  "GATE inv5 5 O=!a; PIN * INV 2.5 20.0 0.018 0.010 0.018 0.010\n"
+                                  "GATE nand_w 2 O=!(a*b); PIN * INV 0.5 2.0 0.015 0.100 0.015 0.100\n"
+                                  "GATE zero 0 O=CONST0;\nGATE one 0 O=CONST1;";
+  std::vector<gate> gates;
+  std::istringstream in( many_drives );
+  CHECK( lorina::read_genlib( in, genlib_reader( gates ) ) == lorina::return_code::success );
+
+  tech_library_params ps;
+  ps.electrical_model = true;
+  ps.max_drives_per_function = 3u;
+  tech_library<2> lib( gates, ps );
+
+  kitty::static_truth_table<2> tt;
+  kitty::create_from_hex_string( tt, "5" ); /* inverter */
+  auto const* sgs = lib.get_supergates( kitty::extend_to<6>( tt ) );
+  REQUIRE( sgs != nullptr );
+  CHECK( sgs->size() <= 3u );
+
+  bool saw_smallest_area = false, saw_smallest_slope = false;
+  for ( auto const& sg : *sgs )
+  {
+    if ( sg.root->root->name == "inv1" ) saw_smallest_area = true;
+    if ( sg.root->root->name == "inv5" ) saw_smallest_slope = true;
+  }
+  CHECK( saw_smallest_area );
+  CHECK( saw_smallest_slope );
+}
+
+TEST_CASE( "select_inverter sizes a materialized polarity inverter by its load", "[tech_library]" )
+{
+  /* A cover CREATES polarity inverters rather than matching them against a cut, so they never pass
+   * through the candidate comparison that gives every other cell its drive strength. On a real PDK
+   * that is where the highest-fanout drivers end up, so the family has to be selectable directly. */
+  std::vector<gate> gates;
+  std::istringstream in( drive_family_library ); /* inv_w limit 2.0, inv_s limit 20.0 */
+  CHECK( lorina::read_genlib( in, genlib_reader( gates ) ) == lorina::return_code::success );
+
+  tech_library_params ps;
+  ps.electrical_model = true;
+  tech_library<2> lib( gates, ps );
+
+  auto const [inv_area, inv_delay, inv_id] = lib.get_inverter_info();
+  ( void )inv_area;
+  ( void )inv_delay;
+
+  /* no load to choose on -> the smallest inverter, so a load-blind caller is unaffected */
+  CHECK( lib.select_inverter( 0.0f ) == inv_id );
+  /* within the weak cell's limit -> still the smallest (cheapest legal) */
+  CHECK( lib.select_inverter( 1.0f ) == inv_id );
+  CHECK( lib.select_inverter( 2.0f ) == inv_id );
+  /* past it -> the stronger inverter, which is the whole point */
+  uint32_t const strong = lib.select_inverter( 8.0f );
+  CHECK( strong != inv_id );
+  CHECK( lib.inverter_input_load( strong ) > lib.inverter_input_load( inv_id ) );
+  /* beyond EVERY drive limit -> the strongest available, and the caller's own legality report shows
+   * it still over the limit rather than this silently reporting success */
+  CHECK( lib.select_inverter( 1e6f ) == strong );
 }
