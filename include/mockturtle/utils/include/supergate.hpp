@@ -87,6 +87,16 @@ struct supergate
 
   /* pin negations */
   uint16_t polarity{ 0 };
+
+  /* Electrical model (tech_library_params::electrical_model), permuted like tdelay.
+   * slope[i]: delay increase per unit output load through pin i (worst of rise/fall fanout
+   * slope); cap[i]: input capacitance pin i presents to its driver; max_load: the largest
+   * output load this gate may legally drive (0 = no data / unconstrained). All zero when the
+   * library was built without the electrical model, which keeps the mapper's added load terms
+   * exactly 0 and its behavior unchanged. */
+  std::array<float, NInputs> slope{};
+  std::array<float, NInputs> cap{};
+  float max_load{ 0 };
 };
 
 } // namespace mockturtle

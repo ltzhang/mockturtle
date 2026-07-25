@@ -118,6 +118,12 @@ struct tech_library_params
   /*! \brief Remove dominated gates (larger sizes) */
   bool remove_dominated_gates{ true };
 
+  /*! \brief Electrical (load-aware) library model: keep same-function drive variants as
+   * distinct candidates (minimum-size collapse off, dominance compares per-pin delay slopes
+   * beside block delays) and carry each supergate's per-pin slope/capacitance and output
+   * max_load for a load-aware mapper cost. Off: byte-identical library to before. */
+  bool electrical_model{ false };
+
   /*! \brief Loads multioutput gates in single-output library */
   bool load_multioutput_gates_single{ false };
 
@@ -318,6 +324,21 @@ public:
     return std::make_tuple( _inv_area, _inv_delay, _inv_id );
   }
 
+  /*! \brief Electrical data of the smallest inverter: (input capacitance, delay slope per unit
+   * output load). Both 0 unless the library was built with `electrical_model` from gates that
+   * carry pin data — a 0 keeps every load term a mapper adds with them exactly 0. */
+  const std::pair<float, float> get_inverter_electrical() const
+  {
+    return std::make_pair( _inv_cap, _inv_slope );
+  }
+
+  /*! \brief Median input-pin capacitance over the library's simple gates (0 without the
+   * electrical model). The mapper's round-0 load seed: fanout count x this value. */
+  float get_median_pin_cap() const
+  {
+    return _median_pin_cap;
+  }
+
   /*! \brief Get buffer information.
    *
    * Returns area, delay, and ID of the smallest buffer.
@@ -392,6 +413,11 @@ private:
             _inv_delay = compute_worst_delay( gate );
             _inv_id = gate.id;
             inv = true;
+            if ( _ps.electrical_model && !gate.pins.empty() )
+            {
+              _inv_cap = static_cast<float>( gate.pins[0].input_load );
+              _inv_slope = static_cast<float>( std::max( gate.pins[0].rise_fanout_delay, gate.pins[0].fall_fanout_delay ) );
+            }
           }
         }
         else
@@ -405,6 +431,25 @@ private:
             buf = true;
           }
         }
+      }
+    }
+
+    /* median input capacitance (electrical model): the mapper's round-0 load seed */
+    if ( _ps.electrical_model )
+    {
+      std::vector<float> caps;
+      for ( auto const& g : _gates )
+      {
+        for ( auto const& p : g.pins )
+        {
+          if ( p.input_load > 0.0 )
+            caps.push_back( static_cast<float>( p.input_load ) );
+        }
+      }
+      if ( !caps.empty() )
+      {
+        std::nth_element( caps.begin(), caps.begin() + caps.size() / 2, caps.end() );
+        _median_pin_cap = caps[caps.size() / 2];
       }
     }
 
@@ -454,6 +499,8 @@ private:
             sg.tdelay[i] = gate.tdelay[perm[i]];
             sg.polarity |= ( ( neg >> perm[i] ) & 1 ) << i; /* permutate input negation to match the right pin */
           }
+
+          fill_supergate_electricals( sg, gate );
 
           const auto static_tt = kitty::extend_to<truth_table_size>( tt );
 
@@ -515,6 +562,8 @@ private:
             {
               sg.tdelay[i] = gate.tdelay[perm[i]];
             }
+
+            fill_supergate_electricals( sg, gate );
 
             const auto static_tt = kitty::extend_to<truth_table_size>( tt_canon );
 
@@ -606,6 +655,8 @@ private:
             sg.tdelay[i] = gate.tdelay[perm[i]];
           }
 
+          fill_supergate_electricals( sg, gate );
+
           const auto static_tt = kitty::extend_to<truth_table_size>( tt );
 
           auto& v = _super_lib[static_tt];
@@ -667,6 +718,8 @@ private:
             {
               sg.tdelay[i] = gate.tdelay[perm[i]];
             }
+
+            fill_supergate_electricals( sg, gate );
 
             const auto static_tt = kitty::extend_to<truth_table_size>( tt_canon );
 
@@ -1055,6 +1108,37 @@ private:
     return worst_delay;
   }
 
+  /* Fill a supergate's electrical model (slope/cap per permuted pin, output max_load) from its
+   * root gate's pin data. Only a SIMPLE composed gate carries pin-aligned data (composed
+   * supergates have no single pin list); anything else keeps the all-zero default, which makes
+   * every load term computed with it exactly 0 (load-blind). No-op unless electrical_model. */
+  void fill_supergate_electricals( supergate<NInputs>& sg, composed_gate<NInputs> const& g )
+  {
+    if ( !_ps.electrical_model || g.is_super || g.root == nullptr )
+      return;
+    auto const& pins = g.root->pins;
+    if ( pins.size() < g.num_vars )
+      return;
+    for ( auto i = 0u; i < sg.permutation.size() && i < NInputs; ++i )
+    {
+      auto const& p = pins[sg.permutation[i]];
+      sg.slope[i] = static_cast<float>( std::max( p.rise_fanout_delay, p.fall_fanout_delay ) );
+      sg.cap[i] = static_cast<float>( p.input_load );
+    }
+    sg.max_load = static_cast<float>( pins[0].max_load );
+  }
+
+  /* Worst (rise/fall) per-load delay slope of pin @p k of a simple composed gate; 0 when the
+   * gate carries no pin data (composed supergate) — 0 slopes compare equal, so the electrical
+   * dominance test below degenerates to the block-only test for such gates. */
+  float pin_slope( composed_gate<NInputs> const& g, uint32_t k ) const
+  {
+    if ( g.is_super || g.root == nullptr || k >= g.root->pins.size() )
+      return 0.0f;
+    auto const& p = g.root->pins[k];
+    return static_cast<float>( std::max( p.rise_fanout_delay, p.fall_fanout_delay ) );
+  }
+
   bool compare_sizes( composed_gate<NInputs> const& s1, composed_gate<NInputs> const& s2 )
   {
     if ( s1.area < s2.area )
@@ -1100,6 +1184,36 @@ private:
         /* get the same functionality */
         if ( skip_gates[j] || tti != ttj )
           continue;
+
+        /* Electrical model: same-function drive variants are the point — never collapse to the
+         * minimum size, and treat a variant as dominated only when it is worse-or-equal in area,
+         * every pin block delay, AND every pin slope (a higher drive trades area for a smaller
+         * slope, which the block-only test below cannot see). */
+        if ( _ps.electrical_model )
+        {
+          bool i_dominates = supergates[i].area <= supergates[j].area;
+          bool j_dominates = supergates[j].area <= supergates[i].area;
+          for ( uint32_t k = 0; k < tti.num_vars(); ++k )
+          {
+            if ( supergates[i].tdelay[k] > supergates[j].tdelay[k] ||
+                 pin_slope( supergates[i], k ) > pin_slope( supergates[j], k ) )
+              i_dominates = false;
+            if ( supergates[j].tdelay[k] > supergates[i].tdelay[k] ||
+                 pin_slope( supergates[j], k ) > pin_slope( supergates[i], k ) )
+              j_dominates = false;
+          }
+          if ( i_dominates )
+          {
+            skip_gates[j] = true;
+            continue;
+          }
+          if ( j_dominates )
+          {
+            skip_gates[i] = true;
+            break;
+          }
+          continue;
+        }
 
         if ( _ps.load_minimum_size_only )
         {
@@ -1155,6 +1269,11 @@ private:
   float _inv_area{ 0.0 };
   float _inv_delay{ 0.0 };
   uint32_t _inv_id{ UINT32_MAX };
+  /* electrical model of the smallest inverter + the library's median input capacitance
+   * (both 0 unless ps.electrical_model) */
+  float _inv_cap{ 0.0 };
+  float _inv_slope{ 0.0 };
+  float _median_pin_cap{ 0.0 };
 
   /* buffer info */
   float _buf_area{ 0.0 };
