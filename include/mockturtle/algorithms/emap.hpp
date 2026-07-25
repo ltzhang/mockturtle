@@ -142,6 +142,14 @@ struct emap_params
   /*! \brief Wire capacitance charged per fanout edge in the electrical load estimate. */
   double wire_cap_per_fanout{ 0.0 };
 
+  /*! \brief Bounded per-node area-delay Pareto frontier (electrical model only). Each matched
+   * node keeps up to this many non-dominated (arrival, area) points per phase, and at each
+   * non-ELA round end every covered node is re-bound to the cheapest same-cut point that still
+   * meets its required time — now known from the COMPLETE cover, which is what per-match
+   * selection cannot see. 0 (default) = one best match per phase, byte-identical. Hard-capped
+   * at 8 points (see max_curve_points). */
+  uint32_t curve_points{ 0 };
+
   /*! \brief Compute area-oriented alternative matches */
   bool use_match_alternatives{ true };
 
@@ -167,6 +175,14 @@ struct emap_stats
   /*! \brief Worst delay result. */
   double delay{ 0 };
   /*! \brief Power result. */
+  /*! \brief Bound cells whose ESTIMATED load exceeds their own drive limit (electrical model
+   * only). Reported, never a rejection: if no candidate for a node is drive-legal, the strongest
+   * is bound and counted here. A cell that declared no max_load is excluded (0 = unconstrained). */
+  uint32_t max_load_violations{ 0 };
+  /*! \brief Worst estimated load / drive limit ratio over constrained drivers (electrical model
+   * only). */
+  double worst_load_ratio{ 0 };
+
   double power{ 0 };
   /*! \brief Power result. */
   uint32_t inverters{ 0 };
@@ -819,6 +835,9 @@ public:
     std::tie( lib_inv_area, lib_inv_delay, lib_inv_id ) = library.get_inverter_info();
     std::tie( lib_buf_area, lib_buf_delay, lib_buf_id ) = library.get_buffer_info();
     std::tie( lib_inv_cap, lib_inv_slope ) = library.get_inverter_electrical();
+    curve_budget = std::min( ps.curve_points, max_curve_points );
+    if ( curve_budget > 0 )
+      curves.resize( ntk.size() );
     tmp_visited.reserve( 100 );
   }
 
@@ -836,6 +855,9 @@ public:
     std::tie( lib_inv_area, lib_inv_delay, lib_inv_id ) = library.get_inverter_info();
     std::tie( lib_buf_area, lib_buf_delay, lib_buf_id ) = library.get_buffer_info();
     std::tie( lib_inv_cap, lib_inv_slope ) = library.get_inverter_electrical();
+    curve_budget = std::min( ps.curve_points, max_curve_points );
+    if ( curve_budget > 0 )
+      curves.resize( ntk.size() );
     tmp_visited.reserve( 100 );
   }
 
@@ -1939,6 +1961,237 @@ private:
     }
   }
 
+  /*! \brief Re-derive arrivals and required times of the committed cover under the current load
+   * estimate. Uses the existing per-node arrival propagation, so it introduces no second copy of
+   * the arrival walk and has none of `propagate_arrival_times`'s area/iteration side effects. */
+  void recompute_arrivals_and_required()
+  {
+    if ( !ps.electrical_model )
+      return;
+    for ( auto const& n : topo_order )
+    {
+      if ( ntk.is_constant( n ) || ntk.is_pi( n ) )
+        continue;
+      uint32_t const index = ntk.node_to_index( n );
+      auto const& node_data = node_match[index];
+
+      /* only nodes actually IN the cover, mirroring compute_required_time's own guard */
+      if ( !node_data.map_refs[0] && !node_data.map_refs[1] )
+        continue;
+
+      /* propagate_arrival_node's precondition: it derives the second phase either through the
+       * shared-match inverter or from that phase's own gate, so a node matched in ONE phase with
+       * same_match false has no gate to read there. Honoring this here is not optional — an
+       * asserts-enabled build traps, and a release build dereferences null. */
+      if ( !node_data.same_match &&
+           ( node_data.best_gate[0] == nullptr || node_data.best_gate[1] == nullptr ) )
+        continue;
+      if ( node_data.best_gate[0] == nullptr && node_data.best_gate[1] == nullptr )
+        continue;
+
+      propagate_arrival_node( n );
+    }
+
+    delay = 0.0;
+    ntk.foreach_po( [this]( auto s ) {
+      const auto index = ntk.node_to_index( ntk.get_node( s ) );
+      delay = std::max( delay, node_match[index].arrival[ntk.is_complemented( s ) ? 1 : 0] );
+    } );
+
+    compute_required_time();
+  }
+
+  /*! \brief Measure the committed cover's drive legality into the stats (electrical model only).
+   *
+   * The presence test mirrors the counting walk (`same_match || map_refs[use_phase]`, then the
+   * other phase): with `same_match` a node's references can sit entirely in the phase whose
+   * best_gate is null (the inverter-served one), so the intuitive `map_refs[p] && best_gate[p]`
+   * pairing would skip such a node in BOTH phases and silently report a clean 0. */
+  void report_drive_legality()
+  {
+    if ( !ps.electrical_model )
+      return;
+    st.max_load_violations = 0;
+    st.worst_load_ratio = 0.0;
+    auto check = [&]( uint32_t index, uint8_t phase ) {
+      auto const& node_data = node_match[index];
+      if ( node_data.best_gate[phase] == nullptr )
+        return;
+      float const limit = node_data.best_gate[phase]->max_load;
+      if ( limit <= 0.0f )
+        return;
+      st.worst_load_ratio =
+          std::max( st.worst_load_ratio, static_cast<double>( node_loads[index][phase] ) / limit );
+      if ( node_loads[index][phase] > limit )
+        ++st.max_load_violations;
+    };
+    for ( auto const& n : topo_order )
+    {
+      if ( ntk.is_constant( n ) || ntk.is_pi( n ) )
+        continue;
+      uint32_t const index = ntk.node_to_index( n );
+      auto const& node_data = node_match[index];
+      if ( !node_data.map_refs[0] && !node_data.map_refs[1] )
+        continue;
+      uint8_t const use_phase = node_data.best_gate[0] == nullptr ? 1u : 0u;
+      if ( node_data.best_gate[use_phase] == nullptr )
+        continue;
+      if ( node_data.same_match || node_data.map_refs[use_phase] > 0 )
+        check( index, use_phase );
+      if ( !node_data.same_match && node_data.map_refs[use_phase ^ 1] > 0 )
+        check( index, use_phase ^ 1 );
+    }
+  }
+
+  /* --- area-delay frontier (electrical model; ps.curve_points > 0) ------------------------- */
+
+  /*! \brief Offer a matched candidate to a node's bounded (arrival, area) frontier.
+   *
+   * Dominance-pruned: a point no better in BOTH arrival and area than an existing one is
+   * dropped, and a point that dominates existing ones evicts them. When the budget is full the
+   * worst-area point is evicted only if the newcomer is cheaper, so the frontier keeps its
+   * extremes. */
+  void curve_offer( uint32_t index, uint8_t phase, supergate<NInputs> const* gate, double arrival,
+                    float area, float flow, uint16_t polarity, uint32_t cut_index, uint32_t size )
+  {
+    if ( curve_budget == 0 || index >= curves.size() )
+      return;
+
+    curve_set& cs = curves[index][phase];
+
+    for ( uint8_t i = 0; i < cs.size; ++i )
+    {
+      auto const& p = cs.points[i];
+      if ( p.cut != cut_index )
+        continue;
+      /* an existing point on this cut is at least as good in both dimensions */
+      if ( p.arrival <= arrival + epsilon && p.area <= area + epsilon )
+        return;
+    }
+
+    /* drop the points this candidate dominates */
+    uint8_t w = 0;
+    for ( uint8_t i = 0; i < cs.size; ++i )
+    {
+      auto const& p = cs.points[i];
+      const bool dominated =
+          ( p.cut == cut_index ) && ( arrival <= p.arrival + epsilon ) && ( area <= p.area + epsilon );
+      if ( !dominated )
+        cs.points[w++] = cs.points[i];
+    }
+    cs.size = w;
+
+    if ( cs.size >= max_curve_points )
+    {
+      /* full: replace the largest-area point, and only if this one is cheaper */
+      uint8_t worst = 0;
+      for ( uint8_t i = 1; i < cs.size; ++i )
+        if ( cs.points[i].area > cs.points[worst].area )
+          worst = i;
+      if ( cs.points[worst].area <= area )
+        return;
+      cs.points[worst] = best_gate_emap<NInputs>{ gate, arrival, area, flow, polarity, cut_index, size };
+      return;
+    }
+
+    cs.points[cs.size++] =
+        best_gate_emap<NInputs>{ gate, arrival, area, flow, polarity, cut_index, size };
+  }
+
+  /*! \brief Re-bind each covered node to the cheapest frontier point that still meets its
+   * required time, now that the required times come from the COMPLETE cover.
+   *
+   * Only points on the node's chosen cut are eligible, so a re-bind never changes which leaves
+   * the node reads: references, area accounting and the cover structure stay valid and only the
+   * cell changes. Each candidate's arrival is recomputed from the current leaf arrivals rather
+   * than reusing the value stored at match time, which was measured under a different load
+   * estimate.
+   *
+   * This is what `use_match_alternatives` cannot do: it also keeps a second point per phase, but
+   * picks it during matching, against the PREVIOUS round's required times. */
+  void reselect_from_curves()
+  {
+    if ( curve_budget == 0 )
+      return;
+    uint32_t rebinds = 0;
+
+    for ( auto const& n : topo_order )
+    {
+      if ( ntk.is_constant( n ) || ntk.is_pi( n ) )
+        continue;
+
+      uint32_t const index = ntk.node_to_index( n );
+      if ( index >= curves.size() )
+        continue;
+      auto& node_data = node_match[index];
+
+      for ( uint8_t phase = 0; phase < 2; ++phase )
+      {
+        if ( node_data.map_refs[phase] == 0 || node_data.best_gate[phase] == nullptr )
+          continue;
+
+        curve_set const& cs = curves[index][phase];
+        if ( cs.size < 2 )
+          continue;
+
+        double const required = node_data.required[phase];
+        auto const& cut = cuts[index][node_data.best_cut[phase]];
+
+        supergate<NInputs> const* best = node_data.best_gate[phase];
+        float best_area = node_data.area[phase];
+        double best_arrival = node_data.arrival[phase];
+        uint16_t best_polarity = node_data.phase[phase];
+
+        for ( uint8_t i = 0; i < cs.size; ++i )
+        {
+          auto const& p = cs.points[i];
+          if ( p.gate == nullptr || p.cut != node_data.best_cut[phase] )
+            continue;
+
+          /* recompute this candidate's arrival under the CURRENT load estimate */
+          double arrival = 0.0;
+          uint32_t ctr = 0u;
+          for ( auto l : cut )
+          {
+            uint8_t const leaf_phase = ( p.phase >> ctr ) & 1;
+            arrival = std::max( arrival, node_match[l].arrival[leaf_phase] +
+                                             gate_delay( p.gate, ctr, index, phase ) );
+            ++ctr;
+          }
+
+          if ( arrival > required + epsilon )
+            continue; /* does not meet the node's required time */
+          if ( ps.electrical_model && !gate_load_legal( p.gate, index, phase ) &&
+               gate_load_legal( best, index, phase ) )
+            continue; /* never trade a drive-legal binding for an illegal one */
+          if ( p.area + epsilon >= best_area )
+            continue; /* not cheaper */
+
+          best = p.gate;
+          best_area = p.area;
+          best_arrival = arrival;
+          best_polarity = p.phase;
+        }
+
+        if ( best != node_data.best_gate[phase] )
+        {
+          node_data.best_gate[phase] = best;
+          node_data.area[phase] = best_area;
+          node_data.arrival[phase] = best_arrival;
+          node_data.phase[phase] = best_polarity;
+          ++rebinds;
+        }
+      }
+    }
+
+    if ( ps.verbose && rebinds > 0 )
+    {
+      std::stringstream stats{};
+      stats << fmt::format( "[i] Frontier : re-bound {} node(s) against the complete cover's required times\n", rebinds );
+      st.round_stats.push_back( stats.str() );
+    }
+  }
+
   /* --- end electrical model --------------------------------------------------------------- */
 
   inline void match_propagate_required( uint32_t index )
@@ -2141,12 +2394,15 @@ private:
       }
     }
 
-    /* refresh the electrical load estimate from this round's committed cover */
-    update_node_loads();
     ++iteration;
 
     if constexpr ( ELA )
     {
+      /* ELA rounds refresh the load estimate too (the cover just changed under them), and must
+       * restore the (arrival, required) consistency the moved delay model broke — stale required
+       * times would send every heavily loaded node into the ignore-required fallback next round. */
+      update_node_loads();
+      recompute_arrivals_and_required();
       return true;
     }
 
@@ -2156,6 +2412,22 @@ private:
     {
       node_match[i].est_refs[0] = std::max( 1.0f, coef * node_match[i].est_refs[0] + ( 1 - coef ) * node_match[i].map_refs[0] );
       node_match[i].est_refs[1] = std::max( 1.0f, coef * node_match[i].est_refs[1] + ( 1 - coef ) * node_match[i].map_refs[1] );
+    }
+
+    /* refresh the electrical load estimate from this round's committed cover (EXACT, not damped —
+     * measured better than a damped blend on the ibex drive-legality benchmark), then restore the
+     * (arrival, required) consistency the moved delay model broke. */
+    update_node_loads();
+    recompute_arrivals_and_required();
+
+    /* Re-bind each covered node against the required times of the COMPLETE cover (area-delay
+     * frontier), then restore consistency again: the re-selection changes arrivals, and leaving
+     * the required times derived from the old ones is the same staleness trap the load
+     * refinement above has to avoid. */
+    if ( curve_budget > 0 )
+    {
+      reselect_from_curves();
+      recompute_arrivals_and_required();
     }
 
     return true;
@@ -2309,12 +2581,15 @@ private:
       }
     }
 
-    /* refresh the electrical load estimate from this round's committed cover */
-    update_node_loads();
     ++iteration;
 
     if constexpr ( ELA )
     {
+      /* ELA rounds refresh the load estimate too (the cover just changed under them), and must
+       * restore the (arrival, required) consistency the moved delay model broke — stale required
+       * times would send every heavily loaded node into the ignore-required fallback next round. */
+      update_node_loads();
+      recompute_arrivals_and_required();
       return true;
     }
 
@@ -2324,6 +2599,22 @@ private:
     {
       node_match[i].est_refs[0] = std::max( 1.0f, coef * node_match[i].est_refs[0] + ( 1 - coef ) * node_match[i].map_refs[0] );
       node_match[i].est_refs[1] = std::max( 1.0f, coef * node_match[i].est_refs[1] + ( 1 - coef ) * node_match[i].map_refs[1] );
+    }
+
+    /* refresh the electrical load estimate from this round's committed cover (EXACT, not damped —
+     * measured better than a damped blend on the ibex drive-legality benchmark), then restore the
+     * (arrival, required) consistency the moved delay model broke. */
+    update_node_loads();
+    recompute_arrivals_and_required();
+
+    /* Re-bind each covered node against the required times of the COMPLETE cover (area-delay
+     * frontier), then restore consistency again: the re-selection changes arrivals, and leaving
+     * the required times derived from the old ones is the same staleness trap the load
+     * refinement above has to avoid. */
+    if ( curve_budget > 0 )
+    {
+      reselect_from_curves();
+      recompute_arrivals_and_required();
     }
 
     return true;
@@ -2448,6 +2739,10 @@ private:
 
   void propagate_arrival_times()
   {
+    /* the walk below derives arrivals, so the load estimate must be refreshed BEFORE it — a
+     * refresh after the walk would leave the arrivals it just computed stale against the loads */
+    update_node_loads();
+
     area = 0.0f;
     inv = 0;
     for ( auto const& n : topo_order )
@@ -2563,9 +2858,6 @@ private:
         delay = std::max( delay, node_match[index].arrival[0] );
     } );
 
-    /* refresh the electrical load estimate from this round's committed cover */
-    update_node_loads();
-
     /* return if mapping is area oriented */
     ++iteration;
     if ( ps.area_oriented_mapping )
@@ -2646,6 +2938,10 @@ private:
      * alternative gA keeps the pure cost comparison — it competes under required-time checks
      * downstream, and its arrival already carries the load term) */
     bool best_legal = false;
+    /* the frontier is rebuilt with the match: a point from a previous round would carry a cut
+     * index that no longer means the same thing */
+    if ( curve_budget > 0 && index < curves.size() )
+      curves[index][phase].size = 0;
 
     /* unmap multioutput */
     node_data.multioutput_match[phase] = false;
@@ -2708,6 +3004,12 @@ private:
           if ( worst_arrival > node_data.required[phase] + epsilon || worst_arrival >= std::numeric_limits<float>::max() )
             skip = true;
         }
+
+        /* every feasible candidate is offered to the node's frontier, so a post-cover
+         * re-selection has real alternatives to choose from (see reselect_from_curves) */
+        if ( !skip )
+          curve_offer( index, phase, &gate, worst_arrival, gate.area, area_local, gate_polarity,
+                       cut_index, cut->size() );
 
         /* electrical model: a drive that can legally carry the signal's load outranks one
          * that cannot; among equals the usual cost comparison decides. Inert with the model
@@ -4600,6 +4902,7 @@ private:
     /* write final results */
     st.area = area;
     st.delay = delay;
+    report_drive_legality();
     if ( ps.eswp_rounds )
       st.power = compute_switching_power();
   }
@@ -4719,6 +5022,7 @@ private:
     st.area = area;
     st.delay = delay;
     st.multioutput_gates = multioutput_count;
+    report_drive_legality();
     if ( ps.eswp_rounds )
       st.power = compute_switching_power();
   }
@@ -6034,6 +6338,17 @@ private:
   float lib_inv_cap{ 0 };
   float lib_inv_slope{ 0 };
   std::vector<std::array<float, 2>> node_loads;
+
+  /* bounded per-node, per-phase area-delay frontier (`curve_points` only; empty otherwise). The
+   * frontier school is the memory-hungry one, so the budget is hard-capped. */
+  static constexpr uint32_t max_curve_points = 8;
+  struct curve_set
+  {
+    std::array<best_gate_emap<NInputs>, max_curve_points> points{};
+    uint8_t size{ 0 };
+  };
+  std::vector<std::array<curve_set, 2>> curves;
+  uint32_t curve_budget{ 0 };
 
   /* lib buffer info */
   float lib_buf_area;
