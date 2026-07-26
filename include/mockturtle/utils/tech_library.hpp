@@ -405,6 +405,49 @@ public:
     return std::make_tuple( _buf_area, _buf_delay, _buf_id );
   }
 
+  /*! \brief One buffer drive option (electrical model). Unlike the inverter family — whose
+   * consumers price with the smallest inverter's aggregate block/slope — the optional
+   * output-buffer covering stage prices the SELECTED drive exactly, so the family carries the
+   * timing terms alongside cap/limit. `id == UINT32_MAX` is the "no buffer available" sentinel
+   * returned by select_buffer on a buffer-less library. */
+  struct buffer_drive
+  {
+    uint32_t id{ UINT32_MAX };
+    float area{ 0.0f };
+    float max_load{ 0.0f }; /* 0 = undeclared/unconstrained */
+    float cap{ 0.0f };      /* input capacitance the buffer presents to its driver */
+    float block{ 0.0f };    /* load-independent delay term */
+    float slope{ 0.0f };    /* delay per unit output load */
+  };
+
+  /*! \brief Smallest buffer drive that can legally drive @p load. Mirrors select_inverter's
+   * contract: first legal hit in the area-ascending family; when none can carry the load, the
+   * drive with the largest limit (best illegal — never "no buffer" once a family exists). A
+   * sentinel (id == UINT32_MAX) means the library has no buffer or the electrical model is off. */
+  buffer_drive select_buffer( float load ) const
+  {
+    if ( _buffers.empty() )
+      return buffer_drive{};
+    for ( auto const& b : _buffers )
+    {
+      if ( b.max_load <= 0.0f || load <= b.max_load + epsilon )
+        return b;
+    }
+    auto best = _buffers.front();
+    for ( auto const& b : _buffers )
+    {
+      if ( b.max_load > best.max_load )
+        best = b;
+    }
+    return best;
+  }
+
+  /*! \brief True when the electrical model recorded at least one buffer drive. */
+  bool has_buffer_drives() const
+  {
+    return !_buffers.empty();
+  }
+
   /*! \brief Returns the maximum number of variables of the gates. */
   unsigned max_gate_size()
   {
@@ -494,12 +537,26 @@ private:
             _buf_id = gate.id;
             buf = true;
           }
+          /* electrical model: record the whole buffer drive family for select_buffer (the
+           * optional output-buffer covering stage). Zero-pin guard: a 0-input tie cell has no
+           * pins to read (the 405b50a lesson). */
+          if ( _ps.electrical_model && !gate.pins.empty() )
+          {
+            _buffers.push_back( buffer_drive{ gate.id, static_cast<float>( gate.area ),
+                                              static_cast<float>( gate.pins[0].max_load ),
+                                              static_cast<float>( gate.pins[0].input_load ),
+                                              static_cast<float>( compute_worst_delay( gate ) ),
+                                              static_cast<float>( std::max( gate.pins[0].rise_fanout_delay, gate.pins[0].fall_fanout_delay ) ) } );
+          }
         }
       }
     }
 
     /* the inverter family, smallest first, so select_inverter's first legal hit is minimal */
     std::sort( _inverters.begin(), _inverters.end(),
+               []( auto const& a, auto const& b ) { return a.area < b.area; } );
+    /* the buffer family, same contract */
+    std::sort( _buffers.begin(), _buffers.end(),
                []( auto const& a, auto const& b ) { return a.area < b.area; } );
 
     /* median input capacitance (electrical model): the mapper's round-0 load seed */
@@ -1458,6 +1515,7 @@ private:
   float _buf_area{ 0.0 };
   float _buf_delay{ 0.0 };
   uint32_t _buf_id{ UINT32_MAX };
+  std::vector<buffer_drive> _buffers; /* area-ascending; empty without the electrical model */
 
   unsigned _max_size{ 0 }; /* max #fanins of the gates in the library */
 

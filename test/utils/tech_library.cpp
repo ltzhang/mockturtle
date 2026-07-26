@@ -1279,3 +1279,61 @@ TEST_CASE( "select_inverter sizes a materialized polarity inverter by its load",
    * it still over the limit rather than this silently reporting success */
   CHECK( lib.select_inverter( 1e6f ) == strong );
 }
+
+TEST_CASE( "select_buffer records a drive family and sizes by load", "[tech_library]" )
+{
+  /* The optional output-buffer covering stage chooses a buffer against the signal's real load,
+   * exactly as select_inverter does for materialized polarity inverters — but it prices the
+   * SELECTED drive, so the family carries block/slope, not only cap/limit. */
+  std::string const buf_family = "GATE inv_w 1 O=!a;     PIN * INV 0.5 2.0  0.010 0.100 0.010 0.100\n"
+                                 "GATE buf_w 2 O=a;      PIN * NONINV 0.6 3.0  0.020 0.080 0.020 0.080\n"
+                                 "GATE buf_s 4 O=a;      PIN * NONINV 0.7 40.0 0.030 0.005 0.030 0.005\n"
+                                 "GATE nand_w 2 O=!(a*b); PIN * INV 0.5 2.0 0.015 0.100 0.015 0.100\n"
+                                 "GATE zero 0 O=CONST0;\nGATE one 0 O=CONST1;";
+  std::vector<gate> gates;
+  std::istringstream in( buf_family );
+  CHECK( lorina::read_genlib( in, genlib_reader( gates ) ) == lorina::return_code::success );
+
+  tech_library_params ps;
+  ps.electrical_model = true;
+  tech_library<2> lib( gates, ps );
+  REQUIRE( lib.has_buffer_drives() );
+
+  auto const [buf_area, buf_delay, buf_id] = lib.get_buffer_info();
+  ( void )buf_area;
+  ( void )buf_delay;
+
+  /* light load -> the smallest (cheapest legal) buffer, which is also get_buffer_info's cell */
+  auto const light = lib.select_buffer( 1.0f );
+  CHECK( light.id == buf_id );
+  CHECK( light.slope == Approx( 0.080f ) );
+  /* past the weak drive's limit -> the strong one, with its own electrical terms */
+  auto const heavy = lib.select_buffer( 8.0f );
+  CHECK( heavy.id != light.id );
+  CHECK( heavy.max_load == Approx( 40.0f ) );
+  CHECK( heavy.cap > light.cap );
+  CHECK( heavy.slope < light.slope );
+  /* beyond every limit -> the largest-limit drive (best illegal, never "no buffer") */
+  CHECK( lib.select_buffer( 1e6f ).id == heavy.id );
+}
+
+TEST_CASE( "select_buffer without the electrical model is the sentinel", "[tech_library]" )
+{
+  /* Off means off: no family is recorded, the sentinel comes back, and get_buffer_info is
+   * unchanged — a load-blind caller sees exactly the pre-family library. */
+  std::string const buf_lib = "GATE inv_w 1 O=!a; PIN * INV 0.5 2.0 0.010 0.100 0.010 0.100\n"
+                              "GATE buf_w 2 O=a;  PIN * NONINV 0.6 3.0 0.020 0.080 0.020 0.080\n"
+                              "GATE nand_w 2 O=!(a*b); PIN * INV 0.5 2.0 0.015 0.100 0.015 0.100\n"
+                              "GATE zero 0 O=CONST0;\nGATE one 0 O=CONST1;";
+  std::vector<gate> gates;
+  std::istringstream in( buf_lib );
+  CHECK( lorina::read_genlib( in, genlib_reader( gates ) ) == lorina::return_code::success );
+
+  tech_library<2> lib( gates );
+  CHECK( !lib.has_buffer_drives() );
+  CHECK( lib.select_buffer( 8.0f ).id == UINT32_MAX );
+  auto const [buf_area, buf_delay, buf_id] = lib.get_buffer_info();
+  ( void )buf_area;
+  ( void )buf_delay;
+  CHECK( buf_id != UINT32_MAX ); /* the smallest-buffer info itself still exists */
+}

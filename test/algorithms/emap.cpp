@@ -1245,3 +1245,143 @@ TEST_CASE( "emap frontier re-selection keeps the cover valid and no more expensi
       CHECK( res.has_binding( n ) );
   } );
 }
+
+/* BP-18(a): the optional single-input covering stage. The forcing property of this library is that
+ * there is NO strong nand — with -load-aware alone the hot driver is stuck at max_load 2.0 against
+ * 16 x 0.5 = 8.0, a 4x violation NO drive selection can fix. The only legal cover routes the weak
+ * nand through the strong buffer (driver sees 0.5, buffer carries 8.0 <= 40.0), so this fixture
+ * proves the mechanism does something drive selection cannot. */
+std::string const buffer_stage_library = "GATE   nand_w  2 O=!(a*b); PIN * INV 0.5 2.0  0.015 0.100 0.015 0.100\n"
+                                         "GATE   inv_w   1 O=!a;     PIN * INV 0.5 2.0  0.010 0.100 0.010 0.100\n"
+                                         "GATE   buf_s   3 O=a;      PIN * NONINV 0.5 40.0 0.030 0.005 0.030 0.005\n"
+                                         "GATE   zero    0 O=CONST0;\n"
+                                         "GATE   one     0 O=CONST1;";
+
+namespace
+{
+aig_network many_sink_aig( uint32_t sinks )
+{
+  aig_network aig;
+  auto const a = aig.create_pi();
+  auto const b = aig.create_pi();
+  auto const t = aig.create_and( a, b );
+  for ( uint32_t i = 0; i < sinks; ++i )
+  {
+    auto const p = aig.create_pi();
+    aig.create_po( aig.create_and( !t, p ) );
+  }
+  return aig;
+}
+
+struct buffer_probe
+{
+  emap_stats st;
+  uint32_t buffers_bound{ 0 };
+  bool all_bound{ true };
+};
+
+buffer_probe map_with_buffer_stage( uint32_t sinks, bool cover_buffer )
+{
+  std::vector<gate> gates;
+  std::istringstream in( buffer_stage_library );
+  lorina::read_genlib( in, genlib_reader( gates ) );
+
+  tech_library_params tps;
+  tps.electrical_model = true;
+  tech_library<3> tlib( gates, tps );
+
+  emap_params ps;
+  ps.electrical_model = true;
+  ps.cover_buffer = cover_buffer;
+  ps.area_oriented_mapping = false;
+
+  buffer_probe out;
+  aig_network aig = many_sink_aig( sinks );
+  auto res = emap_klut( aig, tlib, ps, &out.st );
+  res.foreach_node( [&]( auto const& n ) {
+    if ( res.is_constant( n ) || res.is_pi( n ) )
+      return;
+    if ( !res.has_binding( n ) )
+    {
+      out.all_bound = false;
+      return;
+    }
+    if ( res.get_binding( n ).name == "buf_s" )
+      ++out.buffers_bound;
+  } );
+  return out;
+}
+} // namespace
+
+TEST_CASE( "emap cover-buffer stage rescues a load no drive selection can carry", "[emap]" )
+{
+  /* off: the weak-only library leaves the 16-sink driver in violation */
+  auto const off = map_with_buffer_stage( 16, false );
+  CHECK( off.st.max_load_violations >= 1 );
+  CHECK( off.st.worst_load_ratio > 3.0 );
+  CHECK( off.st.cover_buffers == 0 );
+  CHECK( off.buffers_bound == 0 );
+  CHECK( off.all_bound );
+
+  /* on: the cover chooses a buffer, the violation disappears, area grows by the buffer */
+  auto const on = map_with_buffer_stage( 16, true );
+  CHECK( on.st.cover_buffers >= 1 );
+  CHECK( on.buffers_bound >= 1 );
+  CHECK( on.st.max_load_violations == 0 );
+  CHECK( on.all_bound );
+  CHECK( on.st.area > off.st.area );
+}
+
+TEST_CASE( "emap cover-buffer identity branch really competes", "[emap]" )
+{
+  /* one sink: load 0.5 sits below the buffer's crossover (slope_g*L < slope_g*cap + block +
+   * slope_b*L), so buffering would ADD modeled delay — the zero-cost wire branch must win. Note
+   * two sinks is already past the crossover for this steep-slope library AND on the critical path
+   * (emap's PO required time IS the achieved delay), so a buffer there is the delay-optimal pick,
+   * not a bug — which is exactly why the identity check uses the sub-crossover load. */
+  auto const light = map_with_buffer_stage( 1, true );
+  CHECK( light.st.cover_buffers == 0 );
+  CHECK( light.buffers_bound == 0 );
+  CHECK( light.st.max_load_violations == 0 );
+}
+
+TEST_CASE( "emap cover-buffer default off is byte-identical", "[emap]" )
+{
+  emap_params defaults;
+  CHECK( defaults.cover_buffer == false );
+  auto const a = map_with_buffer_stage( 8, false );
+  auto const b = map_with_buffer_stage( 8, false );
+  CHECK( a.st.area == b.st.area );
+  CHECK( a.st.delay == b.st.delay );
+  CHECK( a.st.cover_buffers == 0 );
+}
+
+TEST_CASE( "emap cover-buffer composes with the frontier re-bind", "[emap]" )
+{
+  /* buffer decides the load, curve re-binds the cell under that load — the ordering inside the
+   * refresh seams; together they must stay legal and fully bound */
+  std::vector<gate> gates;
+  std::istringstream in( buffer_stage_library );
+  lorina::read_genlib( in, genlib_reader( gates ) );
+  tech_library_params tps;
+  tps.electrical_model = true;
+  tech_library<3> tlib( gates, tps );
+
+  emap_params ps;
+  ps.electrical_model = true;
+  ps.cover_buffer = true;
+  ps.curve_points = 4;
+  ps.area_oriented_mapping = false;
+  emap_stats st;
+  aig_network aig = many_sink_aig( 16 );
+  auto res = emap_klut( aig, tlib, ps, &st );
+
+  CHECK( st.max_load_violations == 0 );
+  CHECK( st.cover_buffers >= 1 );
+  bool all_bound = true;
+  res.foreach_node( [&]( auto const& n ) {
+    if ( !res.is_constant( n ) && !res.is_pi( n ) && !res.has_binding( n ) )
+      all_bound = false;
+  } );
+  CHECK( all_bound );
+}

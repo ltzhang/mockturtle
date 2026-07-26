@@ -150,6 +150,13 @@ struct emap_params
    * at 8 points (see max_curve_points). */
   uint32_t curve_points{ 0 };
 
+  /*! \brief Optional single-input covering stage (electrical model only): after each load
+   * refresh, every covered node may CHOOSE a library buffer on its output — the driver then sees
+   * only the buffer's input capacitance while the buffer carries the sink load — priced by the
+   * same block + slope × load model as every other candidate, with "no buffer" (the zero-cost
+   * identity) always competing. Off (default): byte-identical mapping. */
+  bool cover_buffer{ false };
+
   /*! \brief Compute area-oriented alternative matches */
   bool use_match_alternatives{ true };
 
@@ -182,6 +189,8 @@ struct emap_stats
   /*! \brief Worst estimated load / drive limit ratio over constrained drivers (electrical model
    * only). */
   double worst_load_ratio{ 0 };
+  /*! \brief Output buffers the optional single-input covering stage chose (cover_buffer only). */
+  uint32_t cover_buffers{ 0 };
 
   double power{ 0 };
   /*! \brief Power result. */
@@ -838,6 +847,9 @@ public:
     curve_budget = std::min( ps.curve_points, max_curve_points );
     if ( curve_budget > 0 )
       curves.resize( ntk.size() );
+    buffer_stage = ps.cover_buffer && ps.electrical_model && library.has_buffer_drives();
+    if ( buffer_stage )
+      node_buffers.resize( ntk.size() );
     tmp_visited.reserve( 100 );
   }
 
@@ -858,6 +870,9 @@ public:
     curve_budget = std::min( ps.curve_points, max_curve_points );
     if ( curve_budget > 0 )
       curves.resize( ntk.size() );
+    buffer_stage = ps.cover_buffer && ps.electrical_model && library.has_buffer_drives();
+    if ( buffer_stage )
+      node_buffers.resize( ntk.size() );
     tmp_visited.reserve( 100 );
   }
 
@@ -1863,6 +1878,25 @@ private:
     return node_loads[index][phase] <= g->max_load + epsilon;
   }
 
+  /* Extra delay of the optional output buffer on (index, phase)'s signal (cover_buffer only):
+   * block + slope × the SINK load the buffer carries. 0 when the stage is off or the identity
+   * ("no buffer") was chosen — the zero-cost wire branch of the two-level covering decision. */
+  inline double buffer_delay_at( uint32_t index, uint8_t phase ) const
+  {
+    if ( !buffer_stage || !node_buffers[index][phase].active )
+      return 0.0;
+    auto const& b = node_buffers[index][phase];
+    return b.drive.block + b.drive.slope * b.sink_load;
+  }
+
+  /* Area of the optional output buffer on (index, phase)'s signal; 0 when none. */
+  inline float buffer_area_at( uint32_t index, uint8_t phase ) const
+  {
+    if ( !buffer_stage || !node_buffers[index][phase].active )
+      return 0.0f;
+    return node_buffers[index][phase].drive.area;
+  }
+
   /* The binding for a MATERIALIZED polarity inverter on (index, inv_phase)'s signal: under the
    * electrical model, the smallest inverter drive that legally carries that signal's real load
    * (tech_library::select_inverter) — a hardcoded smallest inverter on a high-fanout net is the
@@ -1959,6 +1993,108 @@ private:
         charge_cut( index, use_phase ^ 1 );
       }
     }
+
+    select_output_buffers();
+  }
+
+  /* Optional single-input covering stage (cover_buffer): once the raw sink sums are known, every
+   * covered signal decides between the zero-cost identity ("no buffer" — the wire branch) and a
+   * library buffer drive, priced by the same block + slope × load model as every other candidate.
+   * An active buffer REWRITES node_loads[index][phase] to the load the DRIVER actually sees (the
+   * buffer's input capacitance + wire), so every existing reader — gate_delay, gate_load_legal,
+   * the curve re-bind — prices the buffered driver without knowing buffers exist; the sink load
+   * the buffer carries is kept in the choice for legality reporting and buffer_delay_at.
+   *
+   * Decision rule, mirroring the match pick's legality-first shape: a buffer is chosen when it
+   * turns an illegal driver legal, or when both branches are legal and it strictly reduces the
+   * driver-path delay. Hysteresis: an active buffer is kept unless strictly worse (and never
+   * while it is the only legal branch) — the load refresh is exact and undamped, and a
+   * discontinuous Σsinks → cap flip is exactly what an undamped fixed point can oscillate on.
+   *
+   * v1 scope (recorded residual): gate outputs serving ONE polarity only — PI signals, constant
+   * signals, and same_match nodes whose complement is also referenced (the materialized polarity
+   * inverter would have to re-read the buffered signal and its own load model) keep bare nets. */
+  void select_output_buffers()
+  {
+    if ( !buffer_stage )
+      return;
+    float const wire = static_cast<float>( ps.wire_cap_per_fanout );
+    uint32_t count = 0;
+    for ( auto const& n : topo_order )
+    {
+      uint32_t const index = ntk.node_to_index( n );
+      if ( ntk.is_constant( n ) || ntk.is_pi( n ) )
+      {
+        node_buffers[index][0].active = node_buffers[index][1].active = false;
+        continue;
+      }
+      auto const& node_data = node_match[index];
+      bool const dual_service = node_data.same_match && node_data.map_refs[0] > 0 && node_data.map_refs[1] > 0;
+      for ( uint8_t phase = 0; phase < 2; ++phase )
+      {
+        auto& choice = node_buffers[index][phase];
+        supergate<NInputs> const* g = node_data.best_gate[phase];
+        float const raw_load = node_loads[index][phase];
+        if ( g == nullptr || dual_service || node_data.map_refs[phase] == 0 || raw_load <= 0.0f )
+        {
+          choice.active = false;
+          continue;
+        }
+        auto const drive = library.select_buffer( raw_load );
+        if ( drive.id == UINT32_MAX )
+        {
+          choice.active = false;
+          continue;
+        }
+        float const driver_load_buffered = drive.cap + wire;
+        /* the driver's worst output-load sensitivity over the bound cut's pins */
+        float slope_g = 0.0f;
+        {
+          auto const& best_cut = cuts[index][node_data.best_cut[phase]];
+          uint32_t const pins = std::min<uint32_t>( static_cast<uint32_t>( best_cut.size() ), NInputs );
+          for ( uint32_t ctr = 0; ctr < pins; ++ctr )
+            slope_g = std::max( slope_g, g->slope[ctr] );
+        }
+        bool const legal_plain = g->max_load <= 0.0f || raw_load <= g->max_load + epsilon;
+        bool const legal_buf = ( g->max_load <= 0.0f || driver_load_buffered <= g->max_load + epsilon ) &&
+                               ( drive.max_load <= 0.0f || raw_load <= drive.max_load + epsilon );
+        double const d_plain = static_cast<double>( slope_g ) * raw_load;
+        double const d_buf = static_cast<double>( slope_g ) * driver_load_buffered + drive.block + drive.slope * raw_load;
+        /* a delay-driven buffer is offered only where timing actually needs help: on a met signal
+         * the identity (wire) branch wins even when the buffer's flat slope models faster —
+         * otherwise a steep-slope library would buy buffers on every met multi-sink net, paying
+         * area for slack nobody asked for (the required time IS the ask) */
+        bool const critical = node_data.arrival[phase] + epsilon > node_data.required[phase];
+        bool take;
+        if ( legal_buf != legal_plain )
+        {
+          take = legal_buf; /* legality first, the model's own rule */
+        }
+        else if ( choice.active )
+        {
+          /* hysteresis: keep unless strictly worse — criticality gates only FRESH insertions, or
+           * a buffer that just met the node's timing would be removed for having met it */
+          take = d_buf <= d_plain + epsilon;
+        }
+        else
+        {
+          take = critical && d_buf + epsilon < d_plain; /* insert only on strict improvement */
+        }
+        if ( take )
+        {
+          choice.active = true;
+          choice.drive = drive;
+          choice.sink_load = raw_load;
+          node_loads[index][phase] = driver_load_buffered;
+          ++count;
+        }
+        else
+        {
+          choice.active = false;
+        }
+      }
+    }
+    st.cover_buffers = count;
   }
 
   /*! \brief Re-derive arrivals and required times of the committed cover under the current load
@@ -2017,6 +2153,19 @@ private:
       auto const& node_data = node_match[index];
       if ( node_data.best_gate[phase] == nullptr )
         return;
+      /* two-segment check under an active output buffer: the driver sees the buffer's input
+       * (already stored in node_loads by select_output_buffers), the buffer carries the sinks */
+      if ( buffer_stage && node_buffers[index][phase].active )
+      {
+        auto const& b = node_buffers[index][phase];
+        if ( b.drive.max_load > 0.0f )
+        {
+          st.worst_load_ratio =
+              std::max( st.worst_load_ratio, static_cast<double>( b.sink_load ) / b.drive.max_load );
+          if ( b.sink_load > b.drive.max_load )
+            ++st.max_load_violations;
+        }
+      }
       float const limit = node_data.best_gate[phase]->max_load;
       if ( limit <= 0.0f )
         return;
@@ -2232,6 +2381,7 @@ private:
       node_data.required[use_phase] = std::min( node_data.required[use_phase], node_data.required[other_phase] - inv_delay_at( index, other_phase ) );
     }
 
+
     if ( node_data.map_refs[0] )
       assert( node_data.arrival[0] < node_data.required[0] + epsilon );
     if ( node_data.map_refs[1] )
@@ -2242,10 +2392,13 @@ private:
       auto ctr = 0u;
       auto const& best_cut = cuts[index][node_data.best_cut[use_phase]];
       auto const& supergate = node_data.best_gate[use_phase];
+      /* the stored required is at the (optionally buffered) output the sinks see; the gate must
+       * finish a buffer-delay earlier, so the buffer's delay comes off before the gate's */
+      double const buf_use = buffer_delay_at( index, static_cast<uint8_t>( use_phase ) );
       for ( auto leaf : best_cut )
       {
         auto phase = ( node_data.phase[use_phase] >> ctr ) & 1;
-        node_match[leaf].required[phase] = std::min( node_match[leaf].required[phase], node_data.required[use_phase] - gate_delay( supergate, ctr, index, use_phase ) );
+        node_match[leaf].required[phase] = std::min( node_match[leaf].required[phase], node_data.required[use_phase] - buf_use - gate_delay( supergate, ctr, index, use_phase ) );
         ++ctr;
       }
     }
@@ -2255,10 +2408,11 @@ private:
       auto ctr = 0u;
       auto const& best_cut = cuts[index][node_data.best_cut[other_phase]];
       auto const& supergate = node_data.best_gate[other_phase];
+      double const buf_other = buffer_delay_at( index, static_cast<uint8_t>( other_phase ) );
       for ( auto leaf : best_cut )
       {
         auto phase = ( node_data.phase[other_phase] >> ctr ) & 1;
-        node_match[leaf].required[phase] = std::min( node_match[leaf].required[phase], node_data.required[other_phase] - gate_delay( supergate, ctr, index, other_phase ) );
+        node_match[leaf].required[phase] = std::min( node_match[leaf].required[phase], node_data.required[other_phase] - buf_other - gate_delay( supergate, ctr, index, other_phase ) );
         ++ctr;
       }
     }
@@ -2359,7 +2513,7 @@ private:
               node_match[leaf].map_refs[0]++;
           }
         }
-        area += node_data.area[use_phase];
+        area += node_data.area[use_phase] + buffer_area_at( index, static_cast<uint8_t>( use_phase ) );
         if ( node_data.same_match && node_data.map_refs[use_phase ^ 1] > 0 )
         {
           if ( iteration < ps.area_flow_rounds )
@@ -2390,7 +2544,7 @@ private:
               node_match[leaf].map_refs[0]++;
           }
         }
-        area += node_data.area[use_phase];
+        area += node_data.area[use_phase] + buffer_area_at( index, static_cast<uint8_t>( use_phase ) );
       }
     }
 
@@ -2541,7 +2695,7 @@ private:
               node_match[leaf].map_refs[0]++;
           }
         }
-        area += node_data.area[use_phase];
+        area += node_data.area[use_phase] + buffer_area_at( index, static_cast<uint8_t>( use_phase ) );
         if ( node_data.same_match && node_data.map_refs[use_phase ^ 1] > 0 )
         {
           if ( iteration < ps.area_flow_rounds )
@@ -2572,7 +2726,7 @@ private:
               node_match[leaf].map_refs[0]++;
           }
         }
-        area += node_data.area[use_phase];
+        area += node_data.area[use_phase] + buffer_area_at( index, static_cast<uint8_t>( use_phase ) );
       }
 
       if ( !ps.area_oriented_mapping )
@@ -2805,12 +2959,16 @@ private:
         ++ctr;
       }
 
+      /* through the optional output buffer if one is chosen (cover_buffer) */
+      worst_arrival += buffer_delay_at( index, use_phase );
       node_data.arrival[use_phase] = worst_arrival;
 
       /* compute area */
       if ( node_data.map_refs[use_phase] > 0 || ( node_data.same_match && ( node_match[index].map_refs[0] || node_match[index].map_refs[1] ) ) )
       {
         area += node_data.area[use_phase];
+        if ( buffer_stage && node_buffers[index][use_phase].active )
+          area += node_buffers[index][use_phase].drive.area;
         if ( node_data.same_match && node_data.map_refs[use_phase ^ 1] > 0 )
         {
           area += lib_inv_area;
@@ -2839,11 +2997,13 @@ private:
         ++ctr;
       }
 
-      node_data.arrival[use_phase] = worst_arrival;
+      node_data.arrival[use_phase] = worst_arrival + buffer_delay_at( index, use_phase );
 
       if ( node_data.map_refs[use_phase] > 0 )
       {
         area += node_data.area[use_phase];
+        if ( buffer_stage && node_buffers[index][use_phase].active )
+          area += node_buffers[index][use_phase].drive.area;
       }
     }
 
@@ -2890,6 +3050,9 @@ private:
       worst_arrival = std::max( worst_arrival, arrival_pin );
       ++ctr;
     }
+    /* the stored arrival is what the SINKS see: through the optional output buffer if one is
+     * chosen (cover_buffer) */
+    worst_arrival += buffer_delay_at( index, use_phase );
     node_data.arrival[use_phase] = worst_arrival;
 
     /* compute arrival of the other phase */
@@ -2913,7 +3076,7 @@ private:
       ++ctr;
     }
 
-    node_data.arrival[use_phase] = worst_arrival;
+    node_data.arrival[use_phase] = worst_arrival + buffer_delay_at( index, use_phase );
   }
 
   template<bool DO_AREA>
@@ -4799,6 +4962,23 @@ private:
     return true;
   }
 
+  /* Materialize the covering stage's chosen output buffer on (index, phase): a real 1-input
+   * identity node bound to the SELECTED drive, rebinding old2new so every later consumer (the
+   * walk is topological) — and the same_match polarity inverter, created after this — reads the
+   * buffered signal, exactly matching the DP's arrival model. The recipe is the PO-buffer one
+   * (create_node over tt 0x2 + add_binding); klut create_buf is identity and creates no node. */
+  void materialize_cover_buffer( binding_view<klut_network>& res, klut_map& old2new, uint32_t index, uint8_t phase )
+  {
+    if ( !buffer_stage || !node_buffers[index][phase].active )
+      return;
+    static uint64_t _buf_tt = 0x2;
+    kitty::dynamic_truth_table tt_buf( 1 );
+    kitty::create_from_words( tt_buf, &_buf_tt, &_buf_tt + 1 );
+    const auto buf = res.create_node( { old2new[index][phase] }, tt_buf );
+    res.add_binding( res.get_node( buf ), node_buffers[index][phase].drive.id );
+    old2new[index][phase] = buf;
+  }
+
   void finalize_cover( binding_view<klut_network>& res, klut_map& old2new )
   {
     uint32_t multioutput_count = 0;
@@ -4845,6 +5025,7 @@ private:
       if ( node_data.same_match || node_data.map_refs[phase] > 0 )
       {
         create_lut_for_gate( res, old2new, index, phase );
+        materialize_cover_buffer( res, old2new, index, static_cast<uint8_t>( phase ) );
 
         /* add inverted version if used */
         if ( node_data.same_match && node_data.map_refs[phase ^ 1] > 0 )
@@ -4866,6 +5047,7 @@ private:
       if ( !node_data.same_match && node_data.map_refs[phase] > 0 )
       {
         create_lut_for_gate( res, old2new, index, phase );
+        materialize_cover_buffer( res, old2new, index, static_cast<uint8_t>( phase ) );
 
         /* count multioutput gates */
         if ( ps.map_multioutput && node_tuple_match[index].lowest_index && node_data.multioutput_match[phase] )
@@ -6338,6 +6520,19 @@ private:
   float lib_inv_cap{ 0 };
   float lib_inv_slope{ 0 };
   std::vector<std::array<float, 2>> node_loads;
+
+  /* optional single-input covering stage (`cover_buffer` only; empty otherwise). One choice per
+   * (node, phase): the selected buffer drive, or the identity (id == UINT32_MAX = no buffer). The
+   * buffered node's DRIVER load becomes the buffer's input cap; the buffer itself carries the
+   * sink load (kept in sink_load for legality reporting and the buffer's own drive selection). */
+  struct buffer_choice
+  {
+    typename tech_library<NInputs, Configuration>::buffer_drive drive{};
+    float sink_load{ 0.0f };
+    bool active{ false };
+  };
+  std::vector<std::array<buffer_choice, 2>> node_buffers;
+  bool buffer_stage{ false };
 
   /* bounded per-node, per-phase area-delay frontier (`curve_points` only; empty otherwise). The
    * frontier school is the memory-hungry one, so the budget is hard-capped. */
