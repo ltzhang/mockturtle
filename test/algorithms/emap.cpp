@@ -1385,3 +1385,171 @@ TEST_CASE( "emap cover-buffer composes with the frontier re-bind", "[emap]" )
   } );
   CHECK( all_bound );
 }
+
+/* --- load-indexed arrival curves (ADR-0050) ------------------------------------------------ */
+
+/* Two cells of one function that trade an input pin capacitance against a block delay: `and_hi`
+ * is 0.010 faster in its own block term but presents EIGHT TIMES the input capacitance, which its
+ * fanin pays for at 0.050 per unit load. A cover that prices a candidate's leaves at whatever
+ * scalar arrival they happen to carry cannot see that trade at all — the leaf term is identical
+ * for both candidates — so it takes the block delay and hands the bill upstream.
+ *
+ * Neither cell dominates the other in the library filter (each wins one of area / block delay),
+ * so both reach matching and the choice is genuinely the cover's. */
+std::string const cap_choice_library = "GATE   inv     1 O=!a;     PIN * INV     0.5 20.0 0.010 0.050 0.010 0.050\n"
+                                       "GATE   and_lo  2 O=a*b;    PIN * NONINV  0.5 20.0 0.030 0.050 0.030 0.050\n"
+                                       "GATE   and_hi  3 O=a*b;    PIN * NONINV  4.0 20.0 0.020 0.050 0.020 0.050\n"
+                                       "GATE   zero    0 O=CONST0;\n"
+                                       "GATE   one     0 O=CONST1;";
+
+/* No drive limit anywhere: nothing anchors a ladder's ceiling. */
+std::string const no_limit_library = "GATE   inv     1 O=!a;     PIN * INV     0.5 0 0.010 0.050 0.010 0.050\n"
+                                     "GATE   and_lo  2 O=a*b;    PIN * NONINV  0.5 0 0.030 0.050 0.030 0.050\n"
+                                     "GATE   zero    0 O=CONST0;\n"
+                                     "GATE   one     0 O=CONST1;";
+
+namespace
+{
+struct curve_probe
+{
+  uint32_t lo{ 0 };
+  uint32_t hi{ 0 };
+  emap_stats st;
+};
+
+/* A chain, so each cell's input capacitance lands on a cell that has a load slope of its own —
+ * three inputs never form a cut this library can cover with one gate, so the chain survives. */
+aig_network cap_chain_aig()
+{
+  aig_network aig;
+  auto const a = aig.create_pi();
+  auto const b = aig.create_pi();
+  auto const c = aig.create_pi();
+  auto const d = aig.create_pi();
+  auto const t1 = aig.create_and( a, b );
+  auto const t2 = aig.create_and( t1, c );
+  aig.create_po( aig.create_and( t2, d ) );
+  return aig;
+}
+
+curve_probe map_with_curves( uint32_t load_points, std::string const& library = cap_choice_library )
+{
+  std::vector<gate> gates;
+  std::istringstream in( library );
+  lorina::read_genlib( in, genlib_reader( gates ) );
+
+  tech_library_params tps;
+  tps.electrical_model = true;
+  tech_library<3> tlib( gates, tps );
+
+  emap_params ps;
+  ps.electrical_model = true;
+  ps.load_points = load_points;
+  ps.area_oriented_mapping = false;
+
+  curve_probe probe;
+  aig_network aig = cap_chain_aig();
+  auto res = emap_klut( aig, tlib, ps, &probe.st );
+
+  res.foreach_node( [&]( auto const& n ) {
+    if ( !res.has_binding( n ) )
+      return;
+    std::string const& name = res.get_binding( n ).name;
+    if ( name == "and_hi" )
+      ++probe.hi;
+    if ( name == "and_lo" )
+      ++probe.lo;
+  } );
+  return probe;
+}
+} // namespace
+
+TEST_CASE( "emap load-indexed curves charge a candidate for the load it imposes", "[emap]" )
+{
+  auto const scalar = map_with_curves( 0 );
+  auto const curved = map_with_curves( 8 );
+
+  /* one arrival per node: every candidate's leaves look identical, so the block delay decides
+   * and the heavy-pinned cell wins everywhere — three cells, three times the bill upstream */
+  CHECK( scalar.st.load_points == 0 );
+  CHECK( scalar.hi == 3 );
+  CHECK( scalar.lo == 0 );
+
+  /* arrival as a function of load: the leaf is queried at the capacitance the candidate itself
+   * presents, the 0.050-per-unit fanin cost of eight times the pin capacitance outweighs a
+   * 0.010 block saving, and the cover stops handing the bill upstream */
+  CHECK( curved.st.load_points == 8 );
+  CHECK( curved.lo == 2 );
+
+  /* the head of the chain still takes the block-faster cell, and that is CORRECT, not a miss:
+   * its leaves are primary inputs, whose arrival this model holds fixed because no cell drives
+   * them. Charging a candidate for load it puts on something with no modeled driver would be
+   * inventing a cost — the attribution is exactly as wide as the electrical model is. */
+  CHECK( curved.hi == 1 );
+
+  /* and it is a real improvement, not merely a different choice: 3.5x the delay, for less area */
+  CHECK( curved.st.delay < scalar.st.delay );
+  CHECK( curved.st.area < scalar.st.area );
+}
+
+TEST_CASE( "emap load-indexed curves report the ladder they built", "[emap]" )
+{
+  auto const curved = map_with_curves( 4 );
+  CHECK( curved.st.load_points == 4 );
+  /* anchored on library facts: the smallest pin capacitance and the largest declared drive limit */
+  CHECK( curved.st.load_curve_lo == Approx( 0.5 ) );
+  CHECK( curved.st.load_curve_hi == Approx( 20.0 ) );
+  /* the store is one double per (node, phase, point) and is reported before it can surprise anyone */
+  CHECK( curved.st.load_curve_bytes > 0 );
+}
+
+TEST_CASE( "emap load-indexed curves stay inactive where they cannot be built", "[emap]" )
+{
+  emap_params defaults;
+  CHECK( defaults.load_points == 0 );
+
+  /* a single load point IS the scalar model — activating for it would spend memory to compute
+   * the number the mapper already has, so it declines and says so */
+  auto const one = map_with_curves( 1 );
+  CHECK( one.st.load_points == 0 );
+  auto const off = map_with_curves( 0 );
+  CHECK( one.st.delay == off.st.delay );
+  CHECK( one.st.area == off.st.area );
+  CHECK( one.hi == off.hi );
+
+  /* no cell declares a drive limit: there is no ceiling to span, and inventing one would be a
+   * guess dressed as a measurement. Inactive, reported as 0, and the caller can refuse loudly. */
+  auto const unbounded = map_with_curves( 8, no_limit_library );
+  CHECK( unbounded.st.load_points == 0 );
+  CHECK( unbounded.st.load_curve_bytes == 0 );
+}
+
+TEST_CASE( "emap load-indexed curves are deterministic and leave the default cover alone", "[emap]" )
+{
+  auto const a = map_with_curves( 8 );
+  auto const b = map_with_curves( 8 );
+  CHECK( a.st.delay == b.st.delay );
+  CHECK( a.st.area == b.st.area );
+  CHECK( a.hi == b.hi );
+  CHECK( a.lo == b.lo );
+
+  /* the load-blind default cover cannot see this field at all */
+  std::vector<gate> gates;
+  std::istringstream in( cap_choice_library );
+  lorina::read_genlib( in, genlib_reader( gates ) );
+  tech_library<3> tlib( gates, tech_library_params{} );
+
+  emap_params blind;
+  blind.load_points = 8;
+  blind.area_oriented_mapping = false;
+  emap_stats st;
+  aig_network aig = cap_chain_aig();
+  auto res = emap_klut( aig, tlib, blind, &st );
+  CHECK( st.load_points == 0 );
+  bool all_bound = true;
+  res.foreach_node( [&]( auto const& n ) {
+    if ( !res.is_constant( n ) && !res.is_pi( n ) && !res.has_binding( n ) )
+      all_bound = false;
+  } );
+  CHECK( all_bound );
+}

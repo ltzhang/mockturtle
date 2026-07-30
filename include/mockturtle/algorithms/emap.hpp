@@ -51,6 +51,7 @@
 #include "../networks/block.hpp"
 #include "../networks/klut.hpp"
 #include "../utils/cuts.hpp"
+#include "../utils/load_curve.hpp"
 #include "../utils/node_map.hpp"
 #include "../utils/stopwatch.hpp"
 #include "../utils/tech_library.hpp"
@@ -150,6 +151,18 @@ struct emap_params
    * at 8 points (see max_curve_points). */
   uint32_t curve_points{ 0 };
 
+  /*! \brief Load-indexed arrival curves (electrical model only): store each node's arrival as a
+   * FUNCTION of its output load, sampled at this many library-anchored load points, and price a
+   * candidate's leaves at the capacitance that candidate itself presents rather than at the one
+   * scalar estimate the leaf happens to carry.
+   *
+   * Without this, a candidate's input pin capacitance — the one electrical term matching could
+   * know exactly — is invisible: a gate with large input pins slows its fanins and is never
+   * charged for it. 0 (default) or 1 = one arrival per node, byte-identical (a single load point
+   * IS the scalar model). Hard-capped at `max_load_points`; a library declaring no drive limit
+   * anywhere has no ceiling to span and leaves the curves inactive. */
+  uint32_t load_points{ 0 };
+
   /*! \brief Optional single-input covering stage (electrical model only): after each load
    * refresh, every covered node may CHOOSE a library buffer on its output — the driver then sees
    * only the buffer's input capacitance while the buffer carries the sink load — priced by the
@@ -191,6 +204,16 @@ struct emap_stats
   double worst_load_ratio{ 0 };
   /*! \brief Output buffers the optional single-input covering stage chose (cover_buffer only). */
   uint32_t cover_buffers{ 0 };
+  /*! \brief Load points the arrival curves were actually sampled at (`load_points` only). 0 means
+   * the curves stayed inactive — the request was off, a single point, or the library declared no
+   * drive limit to anchor a ceiling on — so a caller can tell "asked for" from "got". */
+  uint32_t load_points{ 0 };
+  /*! \brief Floor and ceiling of the load ladder, in the library's capacitance unit (0 when the
+   * curves are inactive). */
+  double load_curve_lo{ 0 };
+  double load_curve_hi{ 0 };
+  /*! \brief Bytes the curve store occupies (0 when inactive). */
+  uint64_t load_curve_bytes{ 0 };
 
   double power{ 0 };
   /*! \brief Power result. */
@@ -847,6 +870,7 @@ public:
     curve_budget = std::min( ps.curve_points, max_curve_points );
     if ( curve_budget > 0 )
       curves.resize( ntk.size() );
+    init_load_ladder();
     buffer_stage = ps.cover_buffer && ps.electrical_model && library.has_buffer_drives();
     if ( buffer_stage )
       node_buffers.resize( ntk.size() );
@@ -870,6 +894,7 @@ public:
     curve_budget = std::min( ps.curve_points, max_curve_points );
     if ( curve_budget > 0 )
       curves.resize( ntk.size() );
+    init_load_ladder();
     buffer_stage = ps.cover_buffer && ps.electrical_model && library.has_buffer_drives();
     if ( buffer_stage )
       node_buffers.resize( ntk.size() );
@@ -1116,6 +1141,10 @@ private:
             multi_node_update<DO_AREA>( n );
         }
       }
+
+      /* this node's phases have settled: refresh the curves its consumers read (see the same
+       * call in compute_mapping) */
+      update_node_curves( index );
     }
 
     double area_old = area;
@@ -1711,6 +1740,11 @@ private:
         }
       }
 
+      /* this node's phases have settled: refresh the arrival curves its consumers read, in the
+       * same topological pass, so a parent later in this round prices itself against a leaf
+       * curve from THIS round exactly as it already does for scalar arrivals */
+      update_node_curves( index );
+
       assert( node_match[index].arrival[0] < node_match[index].required[0] + epsilon );
       assert( node_match[index].arrival[1] < node_match[index].required[1] + epsilon );
     }
@@ -1906,6 +1940,188 @@ private:
     if ( !ps.electrical_model )
       return lib_inv_id;
     return library.select_inverter( node_loads[index][inv_phase] );
+  }
+
+  /* --- load-indexed arrival curves (ADR-0050) ---------------------------------------------- */
+
+  /* Build the ladder a node's arrival is sampled on and size the store. The anchors are library
+   * facts: the smallest load any sink can present (plus the wire term, which every real edge
+   * carries) and the largest a driver declares it may legally carry.
+   *
+   * The curves stay INACTIVE — every query then answers with the node's scalar arrival, exactly
+   * as before this feature — in three cases the caller must be able to tell apart from a working
+   * ladder, which is why `st.load_points` reports what was built rather than what was asked for:
+   * the model is off, a single point was requested (one load point IS the scalar model), or the
+   * library declares no drive limit anywhere and so has no ceiling to span. */
+  void init_load_ladder()
+  {
+    if ( !ps.electrical_model || ps.load_points < 2 )
+      return;
+    float const wire = static_cast<float>( ps.wire_cap_per_fanout );
+    ladder = build_load_ladder( library.get_min_pin_cap() + wire, library.get_max_drive_load(),
+                                ps.load_points );
+    if ( ladder.size < 2 )
+    {
+      ladder = load_ladder{};
+      return;
+    }
+    node_curves.resize( ntk.size() );
+    st.load_points = ladder.size;
+    st.load_curve_lo = ladder.lo();
+    st.load_curve_hi = ladder.hi();
+    st.load_curve_bytes = load_curve_store_bytes( ntk.size(), ladder.size, sizeof( double ) );
+  }
+
+  /* Arrival at (@p leaf, @p leaf_phase) once @p extra_cap — the input capacitance of the
+   * candidate pin asking the question, plus its wire — is added to that signal's load.
+   *
+   * This is the whole point of the curve. The scalar model answers with the number the leaf
+   * stored under its own load estimate, which is the same answer for every candidate, so a
+   * gate with heavy input pins is never charged for the slowdown it causes upstream.
+   *
+   * The query load is the leaf's currently estimated TOTAL load plus this pin, which
+   * over-states it by whatever this same edge contributed to the estimate last round — bounded
+   * by one pin capacitance, always in the pessimistic direction, and identical in sign for
+   * every candidate, so the ORDER the cover cares about is preserved. Subtracting the exact
+   * previous share would need a per-edge charge record; that refinement is recorded in
+   * ADR-0050 rather than guessed at here. */
+  inline double leaf_arrival( uint32_t leaf, uint8_t leaf_phase, float extra_cap ) const
+  {
+    double const scalar = node_match[leaf].arrival[leaf_phase];
+    if ( node_curves.empty() )
+      return scalar;
+    float const load = node_loads[leaf][leaf_phase] + extra_cap;
+    double const curved = interpolate_curve( ladder, node_curves[leaf][leaf_phase], load, scalar );
+    /* The query load is the leaf's own estimate PLUS a pin, and arrival rises with load, so a
+     * curve can only ever answer at or above the scalar. Taking the max enforces that as an
+     * invariant rather than trusting it: a curve that has not been refreshed yet (a node the
+     * current round has not reached, a phase no match settled on) then answers exactly what the
+     * scalar model would, which is conservative. Answering BELOW the scalar would be optimism
+     * the rest of the mapper reconciles against and cannot absorb — required times derive from
+     * these arrivals. */
+    return curved > scalar ? curved : scalar;
+  }
+
+  /* Same query for the pin @p ctr of candidate @p g. */
+  inline double leaf_arrival_pin( uint32_t leaf, uint8_t leaf_phase, supergate<NInputs> const* g,
+                                  uint32_t ctr ) const
+  {
+    if ( node_curves.empty() )
+      return node_match[leaf].arrival[leaf_phase];
+    return leaf_arrival( leaf, leaf_phase, g->cap[ctr] + static_cast<float>( ps.wire_cap_per_fanout ) );
+  }
+
+  /* How much later this pin makes its leaf arrive: the load penalty the candidate imposes,
+   * 0 with the curves off.
+   *
+   * Required-time propagation must subtract this beside the gate delay. Arrival says
+   * `A_parent = A_leaf + penalty + gate_delay`, so the leaf's deadline is
+   * `required_parent - gate_delay - penalty` — anything looser and the two directions of the
+   * same inequality would use different delay models, which is how a cover ends up asserting
+   * that an arrival it just computed exceeds a required time it derived from the old one. */
+  inline double leaf_load_penalty( uint32_t leaf, uint8_t leaf_phase, supergate<NInputs> const* g,
+                                   uint32_t ctr ) const
+  {
+    if ( node_curves.empty() )
+      return 0.0;
+    return leaf_arrival_pin( leaf, leaf_phase, g, ctr ) - node_match[leaf].arrival[leaf_phase];
+  }
+
+  /* Seed every curve with the node's scalar arrival: a node that never gets a match (a PI, a
+   * constant, a don't-touch box, an unmatched phase) then answers every query exactly as the
+   * scalar model would, so activating the ladder cannot perturb a node the DP does not price. */
+  void init_node_curves()
+  {
+    if ( node_curves.empty() )
+      return;
+    for ( uint32_t i = 0; i < node_curves.size(); ++i )
+    {
+      for ( uint8_t phase = 0; phase < 2; ++phase )
+        node_curves[i][phase].fill( node_match[i].arrival[phase] );
+    }
+
+    /* a primary input's own arrival is fixed, but its NEGATED phase is a materialized inverter,
+     * and an inverter's delay depends on what it drives like any other cell's — the one place a
+     * load curve is not the mapper's to build later, since the DP never matches a PI */
+    ntk.foreach_pi( [&]( auto const& n ) {
+      uint32_t const index = ntk.node_to_index( n );
+      for ( uint32_t k = 0; k < ladder.size; ++k )
+        node_curves[index][1][k] = node_match[index].arrival[0] + lib_inv_delay + lib_inv_slope * ladder.points[k];
+    } );
+  }
+
+  /* Rebuild (index)'s curves from the match it just committed: what this node delivers at each
+   * sampled output load, given the cell it bound and the leaves it reads.
+   *
+   * The curve describes the BOUND match, not the best match available at each load. That keeps
+   * it consistent with `node_data.arrival` — the number the rest of the mapper reconciles
+   * against — instead of handing parents an optimistic envelope no committed cover realizes.
+   * A leaf's stronger alternative still reaches this node, one round later, through the load
+   * refresh the parent's own choice feeds (ADR-0050).
+   *
+   * Called in topological order right after the node's phases settle, so a parent always reads
+   * a leaf curve from the current round, matching how scalar arrivals already flow. */
+  void update_node_curves( uint32_t index )
+  {
+    if ( node_curves.empty() )
+      return;
+
+    auto const& node_data = node_match[index];
+    uint8_t const use_phase = node_data.best_gate[0] != nullptr ? 0u : 1u;
+
+    for ( uint8_t p = 0; p < 2; ++p )
+    {
+      uint8_t const phase = static_cast<uint8_t>( use_phase ^ p ); /* the implemented phase first */
+      auto& curve = node_curves[index][phase];
+      supergate<NInputs> const* g = node_data.best_gate[phase];
+
+      if ( g == nullptr )
+      {
+        if ( p == 1 && node_data.best_gate[phase ^ 1] != nullptr )
+        {
+          /* One cell serving both polarities: this phase is a materialized inverter reading the
+           * implemented signal, so its curve is that signal's arrival plus the inverter's own
+           * block and slope at each sampled load — the same shape as `inv_delay_at`, with the
+           * load axis exposed.
+           *
+           * The base is the implemented phase's SCALAR arrival, deliberately, not its curve at
+           * the inverter's input capacitance: `update_node_loads` already charges that
+           * capacitance onto the implemented signal, so it is inside that arrival. Querying the
+           * curve here would bill the same pin twice. */
+          double const in = node_match[index].arrival[phase ^ 1];
+          for ( uint32_t k = 0; k < ladder.size; ++k )
+            curve[k] = in + lib_inv_delay + lib_inv_slope * ladder.points[k];
+        }
+        else
+        {
+          curve.fill( node_data.arrival[phase] );
+        }
+        continue;
+      }
+
+      /* per-pin line: (leaf arrival at this pin's capacitance + block) + slope x load */
+      std::array<double, NInputs> base{};
+      std::array<float, NInputs> slope{};
+      uint32_t pins = 0;
+      for ( auto l : cuts[index][node_data.best_cut[phase]] )
+      {
+        if ( pins >= NInputs )
+          break;
+        uint8_t const leaf_phase = ( node_data.phase[phase] >> pins ) & 1;
+        base[pins] = node_match[l].arrival[leaf_phase] + g->tdelay[pins];
+        slope[pins] = g->slope[pins];
+        ++pins;
+      }
+
+      double const buffered = buffer_delay_at( index, phase );
+      for ( uint32_t k = 0; k < ladder.size; ++k )
+      {
+        double worst = 0.0;
+        for ( uint32_t i = 0; i < pins; ++i )
+          worst = std::max( worst, base[i] + slope[i] * ladder.points[k] );
+        curve[k] = worst + buffered;
+      }
+    }
   }
 
   void init_node_loads()
@@ -3101,6 +3317,12 @@ private:
      * alternative gA keeps the pure cost comparison — it competes under required-time checks
      * downstream, and its arrival already carries the load term) */
     bool best_legal = false;
+    /* the incumbent's RANKING cost. It shadows node_data.arrival[phase] in the comparison only:
+     * the stored arrival stays the true one, so required times, area recovery and the cover's
+     * own bookkeeping keep reconciling against a single honest number while the choice between
+     * candidates accounts for the load each of them imposes upstream (ADR-0050). Identical to
+     * the arrival with the curves off, which is what keeps the default cover byte-identical. */
+    double best_rank = std::numeric_limits<float>::max();
     /* the frontier is rebuilt with the match: a point from a previous round would carry a cut
      * index that no longer means the same thing */
     if ( curve_budget > 0 && index < curves.size() )
@@ -3133,6 +3355,9 @@ private:
       {
         uint16_t gate_polarity = gate.polarity ^ negation;
         double worst_arrival = 0.0f;
+        /* the same arrival with each leaf charged for the capacitance THIS candidate puts on it
+         * (ADR-0050) — the ranking cost, never a stored time */
+        double rank_arrival = 0.0f;
         double worst_arrivalA = 0.0f;
         float area_local = gate.area;
         float area_localA = gate.area;
@@ -3153,6 +3378,7 @@ private:
 
           double arrival_pin = node_match[l].arrival[leaf_phase] + gate_delay( &gate, ctr, index, phase );
           worst_arrival = std::max( worst_arrival, arrival_pin );
+          rank_arrival = std::max( rank_arrival, arrival_pin + leaf_load_penalty( l, leaf_phase, &gate, ctr ) );
 
           area_local += node_match[l].flows[leaf_phase];
           area_localA += node_match[l].best_alternative[leaf_phase].flow;
@@ -3182,11 +3408,12 @@ private:
         if ( ps.electrical_model && cand_legal != best_legal )
           pick = cand_legal;
         else
-          pick = compare_map<DO_AREA>( worst_arrival, node_data.arrival[phase], area_local, node_data.flows[phase], cut->size(), best_size );
+          pick = compare_map<DO_AREA>( rank_arrival, best_rank, area_local, node_data.flows[phase], cut->size(), best_size );
         if ( !skip && pick )
         {
           node_data.best_gate[phase] = &gate;
           node_data.arrival[phase] = worst_arrival;
+          best_rank = rank_arrival;
           node_data.flows[phase] = area_local;
           node_data.best_cut[phase] = cut_index;
           node_data.area[phase] = gate.area;
@@ -3239,6 +3466,7 @@ private:
   void match_phase_relaxed( node<Ntk> const& n, uint8_t phase )
   {
     double best_arrival = std::numeric_limits<double>::max();
+    double best_rank = std::numeric_limits<double>::max(); /* ranking cost only; see match_phase */
     float best_flow = std::numeric_limits<float>::max();
     float best_area = std::numeric_limits<float>::max();
     uint32_t best_size = UINT32_MAX;
@@ -3274,13 +3502,16 @@ private:
       {
         uint16_t gate_polarity = gate.polarity ^ negation;
         double worst_arrival = 0.0f;
+        double rank_arrival = 0.0f; /* ranking cost only (ADR-0050); see match_phase */
         float flow = gate.area;
 
         auto ctr = 0u;
         for ( auto l : *cut )
         {
           uint8_t leaf_phase = ( gate_polarity >> ctr ) & 1;
-          worst_arrival = std::max( worst_arrival, node_match[l].arrival[leaf_phase] + gate_delay( &gate, ctr, index, phase ) );
+          double const arrival_pin = node_match[l].arrival[leaf_phase] + gate_delay( &gate, ctr, index, phase );
+          worst_arrival = std::max( worst_arrival, arrival_pin );
+          rank_arrival = std::max( rank_arrival, arrival_pin + leaf_load_penalty( l, leaf_phase, &gate, ctr ) );
           if constexpr ( !ExactArea )
             flow += node_match[l].flows[leaf_phase];
           ++ctr;
@@ -3296,8 +3527,9 @@ private:
           flow = cut_measure_mffc<SwitchActivity>( *cut, n, phase );
         }
 
-        if ( compare_map<false>( worst_arrival, best_arrival, flow, best_flow, cut->size(), best_size ) )
+        if ( compare_map<false>( rank_arrival, best_rank, flow, best_flow, cut->size(), best_size ) )
         {
+          best_rank = rank_arrival;
           best_arrival = worst_arrival;
           best_flow = flow;
           best_area = gate.area;
@@ -3326,6 +3558,7 @@ private:
   void match_phase_exact( node<Ntk> const& n, uint8_t phase )
   {
     double best_arrival = std::numeric_limits<float>::max();
+    double best_rank = std::numeric_limits<float>::max(); /* ranking cost only; see match_phase */
     float best_exact_area = std::numeric_limits<float>::max();
     float best_area = std::numeric_limits<float>::max();
     uint32_t best_size = UINT32_MAX;
@@ -3390,12 +3623,15 @@ private:
       {
         uint16_t gate_polarity = gate.polarity ^ negation;
         double worst_arrival = 0.0f;
+        double rank_arrival = 0.0f; /* ranking cost only (ADR-0050); see match_phase */
 
         auto ctr = 0u;
         for ( auto l : *cut )
         {
-          double arrival_pin = node_match[l].arrival[( gate_polarity >> ctr ) & 1] + gate_delay( &gate, ctr, index, phase );
+          uint8_t const leaf_phase = ( gate_polarity >> ctr ) & 1;
+          double arrival_pin = node_match[l].arrival[leaf_phase] + gate_delay( &gate, ctr, index, phase );
           worst_arrival = std::max( worst_arrival, arrival_pin );
+          rank_arrival = std::max( rank_arrival, arrival_pin + leaf_load_penalty( l, leaf_phase, &gate, ctr ) );
           ++ctr;
         }
 
@@ -3412,10 +3648,11 @@ private:
         if ( ps.electrical_model && cand_legal != best_legal )
           pick = cand_legal;
         else
-          pick = compare_map<true>( worst_arrival, best_arrival, area_exact, best_exact_area, cut->size(), best_size );
+          pick = compare_map<true>( rank_arrival, best_rank, area_exact, best_exact_area, cut->size(), best_size );
         if ( pick )
         {
           best_arrival = worst_arrival;
+          best_rank = rank_arrival;
           best_exact_area = area_exact;
           best_area = gate.area;
           best_size = cut->size();
@@ -3990,6 +4227,9 @@ private:
         auto ctr = 0u;
         for ( auto l : cut )
         {
+          /* multi-output matching is block-delay-only and stays outside the electrical model
+           * (ADR-0047), so this leaf read is deliberately the scalar one: a load-indexed query
+           * here would mix a load-aware leaf term into a load-blind candidate cost */
           double arrival_pin = node_match[l].arrival[( gate.polarity >> ctr ) & 1] + gate.tdelay[ctr];
           arrival[j] = std::max( arrival[j], arrival_pin );
           ++ctr;
@@ -4216,6 +4456,9 @@ private:
         auto ctr = 0u;
         for ( auto l : cut )
         {
+          /* multi-output matching is block-delay-only and stays outside the electrical model
+           * (ADR-0047), so this leaf read is deliberately the scalar one: a load-indexed query
+           * here would mix a load-aware leaf term into a load-blind candidate cost */
           double arrival_pin = node_match[l].arrival[( gate.polarity >> ctr ) & 1] + gate.tdelay[ctr];
           arrival[j] = std::max( arrival[j], arrival_pin );
           ++ctr;
@@ -4942,6 +5185,7 @@ private:
         node_data.arrival[0] = node_data.best_alternative[0].arrival = 0;
         node_data.arrival[1] = node_data.best_alternative[1].arrival = inv_delay_at( index, 1 );
       } );
+      init_node_curves();
       return true;
     }
 
@@ -4959,6 +5203,7 @@ private:
       node_data.arrival[1] = node_data.best_alternative[1].arrival = ps.arrival_times[i] + inv_delay_at( index, 1 );
     } );
 
+    init_node_curves();
     return true;
   }
 
@@ -6544,6 +6789,15 @@ private:
   };
   std::vector<std::array<curve_set, 2>> curves;
   uint32_t curve_budget{ 0 };
+
+  /* load-indexed arrival curves (`load_points` only; both empty otherwise). One arrival per
+   * (node, phase, ladder point): what that signal delivers when its output carries that load.
+   * Unlike the area-delay frontier above this keeps no match identity — the node binds exactly
+   * one gate, and the curve exists so that node's CONSUMERS can price themselves against the
+   * load they each impose (ADR-0050). Eight doubles per phase is 128 B/node, an order of
+   * magnitude under a frontier of the same width. */
+  load_ladder ladder{};
+  std::vector<std::array<std::array<double, max_load_points>, 2>> node_curves;
 
   /* lib buffer info */
   float lib_buf_area;
