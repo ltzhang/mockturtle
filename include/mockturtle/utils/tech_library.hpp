@@ -52,6 +52,7 @@
 #include "../io/genlib_reader.hpp"
 #include "../io/super_reader.hpp"
 #include "include/supergate.hpp"
+#include "load_curve.hpp"
 #include "standard_cell.hpp"
 #include "struct_library.hpp"
 #include "super_utils.hpp"
@@ -347,6 +348,26 @@ public:
     return _median_pin_cap;
   }
 
+  /*! \brief Smallest positive input-pin capacitance in the library (0 without the electrical
+   * model). The FLOOR of a load ladder: no sink can present less than this, so it is the
+   * smallest load a match ever has to be priced at. */
+  float get_min_pin_cap() const
+  {
+    return _min_pin_cap;
+  }
+
+  /*! \brief Largest DECLARED output drive limit in the library (0 without the electrical model,
+   * and 0 when no cell declares one).
+   *
+   * The CEILING of a load ladder. An undeclared `max_capacitance` means unconstrained and
+   * therefore contributes no ceiling — a library where no cell declares one has no defensible
+   * upper anchor at all, and this returning 0 is what lets the caller refuse a load-indexed
+   * cover loudly instead of inventing a range to sample over. */
+  float get_max_drive_load() const
+  {
+    return _max_drive_load;
+  }
+
   /*! \brief Smallest inverter that can legally drive @p load (electrical model): the mapper's
    * materialized polarity inverters are not matched, so their drive must be chosen against the
    * signal's real load — a hardcoded smallest inverter on a high-fanout net is exactly the
@@ -559,7 +580,9 @@ private:
     std::sort( _buffers.begin(), _buffers.end(),
                []( auto const& a, auto const& b ) { return a.area < b.area; } );
 
-    /* median input capacitance (electrical model): the mapper's round-0 load seed */
+    /* median input capacitance (electrical model): the mapper's round-0 load seed. The same walk
+     * records the two anchors a load ladder spans (ADR-0050): the smallest capacitance a sink can
+     * present, and the largest load a driver declares it may carry. */
     if ( _ps.electrical_model )
     {
       std::vector<float> caps;
@@ -568,7 +591,14 @@ private:
         for ( auto const& p : g.pins )
         {
           if ( p.input_load > 0.0 )
+          {
             caps.push_back( static_cast<float>( p.input_load ) );
+            if ( _min_pin_cap <= 0.0f || caps.back() < _min_pin_cap )
+              _min_pin_cap = caps.back();
+          }
+          /* an undeclared limit is unconstrained, not a limit of zero: it raises no ceiling */
+          if ( p.max_load > 0.0 && static_cast<float>( p.max_load ) > _max_drive_load )
+            _max_drive_load = static_cast<float>( p.max_load );
         }
       }
       if ( !caps.empty() )
@@ -1502,6 +1532,10 @@ private:
   float _inv_cap{ 0.0 };
   float _inv_slope{ 0.0 };
   float _median_pin_cap{ 0.0 };
+  /* load-ladder anchors (ADR-0050; both 0 unless ps.electrical_model, and the ceiling also 0
+   * when no cell declares a drive limit) */
+  float _min_pin_cap{ 0.0 };
+  float _max_drive_load{ 0.0 };
   struct inverter_drive
   {
     uint32_t id;

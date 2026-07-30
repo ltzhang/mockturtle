@@ -1171,6 +1171,55 @@ TEST_CASE( "tech library carries pin capacitance, load slope, and drive limit", 
   CHECK( lib.get_inverter_electrical().first == 0.5f );
 }
 
+TEST_CASE( "tech library exposes the load ladder's anchors", "[tech_library]" )
+{
+  /* A load-indexed match store samples arrival over a range of output loads (ADR-0050). Both
+   * ends of that range are library facts and nothing else: the smallest capacitance any sink
+   * can present, and the largest a driver is allowed to carry. */
+  std::vector<gate> gates;
+  std::istringstream in( drive_family_library );
+  CHECK( lorina::read_genlib( in, genlib_reader( gates ) ) == lorina::return_code::success );
+
+  tech_library_params ps;
+  ps.electrical_model = true;
+  tech_library<2> lib( gates, ps );
+
+  CHECK( lib.get_min_pin_cap() == 0.5f );
+  CHECK( lib.get_max_drive_load() == 20.0f );
+
+  auto const ladder = build_load_ladder( lib.get_min_pin_cap(), lib.get_max_drive_load(), 4 );
+  REQUIRE( ladder.size == 4 );
+  CHECK( ladder.lo() == Approx( 0.5f ) );
+  CHECK( ladder.hi() == Approx( 20.0f ) );
+
+  /* Without the electrical model there is no electrical data to anchor on, and the accessors
+   * say so with a 0 rather than a plausible number. */
+  tech_library<2> blind( gates, tech_library_params{} );
+  CHECK( blind.get_min_pin_cap() == 0.0f );
+  CHECK( blind.get_max_drive_load() == 0.0f );
+}
+
+TEST_CASE( "a library declaring no drive limit reports no ceiling", "[tech_library]" )
+{
+  /* An undeclared max_capacitance means unconstrained, so such a cell contributes no ceiling.
+   * When NO cell declares one the library has no defensible upper anchor at all: the accessor
+   * returns 0 so the caller can refuse the mechanism loudly instead of inventing a range. */
+  std::string const no_limits = "GATE   inv_w   1 O=!a;     PIN * INV 0.5 0 0.010 0.100 0.010 0.100\n"
+                                "GATE   nand_w  2 O=!(a*b); PIN * INV 0.5 0 0.015 0.100 0.015 0.100\n"
+                                "GATE   zero    0 O=CONST0;\n"
+                                "GATE   one     0 O=CONST1;";
+  std::vector<gate> gates;
+  std::istringstream in( no_limits );
+  CHECK( lorina::read_genlib( in, genlib_reader( gates ) ) == lorina::return_code::success );
+
+  tech_library_params ps;
+  ps.electrical_model = true;
+  tech_library<2> lib( gates, ps );
+
+  CHECK( lib.get_min_pin_cap() == 0.5f );
+  CHECK( lib.get_max_drive_load() == 0.0f );
+}
+
 TEST_CASE( "tech library keeps minimum size only by default", "[tech_library]" )
 {
   /* The default is unchanged: with load_aware off, the strong cell of each function is dominated at
