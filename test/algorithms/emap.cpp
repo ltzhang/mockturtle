@@ -1553,3 +1553,160 @@ TEST_CASE( "emap load-indexed curves are deterministic and leave the default cov
   } );
   CHECK( all_bound );
 }
+
+/* Frontier through the covering DP (emap_params::frontier_points). */
+namespace
+{
+aig_network frontier_adder( uint32_t bits )
+{
+  aig_network aig;
+  std::vector<aig_network::signal> a( bits ), b( bits );
+  std::generate( a.begin(), a.end(), [&]() { return aig.create_pi(); } );
+  std::generate( b.begin(), b.end(), [&]() { return aig.create_pi(); } );
+  auto carry = aig.get_constant( false );
+  carry_ripple_adder_inplace( aig, a, b, carry );
+  for ( auto const& s : a )
+    aig.create_po( s );
+  aig.create_po( carry );
+  return aig;
+}
+
+tech_library<3> frontier_lib()
+{
+  std::vector<gate> gates;
+  std::istringstream in( test_library );
+  lorina::read_genlib( in, genlib_reader( gates ) );
+  return tech_library<3>( gates );
+}
+} // namespace
+
+TEST_CASE( "emap frontier is off by default", "[emap][frontier]" )
+{
+  emap_params ps;
+  CHECK( ps.frontier_points == 0u );
+  auto lib = frontier_lib();
+  aig_network aig = frontier_adder( 4 );
+  emap_stats st;
+  emap_klut( aig, lib, ps, &st );
+  CHECK_FALSE( st.frontier_ran );
+  CHECK( st.frontier_declined.empty() );
+}
+
+TEST_CASE( "emap frontier resolves a valid cover that keeps its delay target", "[emap][frontier]" )
+{
+  auto lib = frontier_lib();
+  for ( uint32_t bits : { 3u, 6u } )
+  {
+    aig_network aig = frontier_adder( bits );
+    for ( uint32_t points : { 2u, 4u, 16u, 1000u } )
+    for ( auto share : { emap_params::frontier_share_t::flow, emap_params::frontier_share_t::cover } )
+    {
+      emap_params ps;
+      ps.frontier_points = points;
+      ps.frontier_share = share;
+      emap_stats st;
+      auto res = emap_klut( aig, lib, ps, &st );
+      INFO( "bits " << bits << " points " << points );
+      REQUIRE( st.frontier_ran );
+      CHECK( st.frontier_declined.empty() );
+      CHECK( st.frontier_nodes > 0u );
+      CHECK( st.frontier_max_size <= 16u ); /* the bound is clamped, not honored */
+      CHECK( st.frontier_bytes > 0u );
+      /* never worse than the cover it entered with: kept only at a smaller area on the same target */
+      CHECK( st.area <= st.frontier_area_before + 1e-6 );
+      if ( st.frontier_kept )
+      {
+        CHECK( st.frontier_area_after < st.frontier_area_before );
+        CHECK( st.frontier_unmet == 0u );
+      }
+      res.foreach_node( [&]( auto const& n ) {
+        if ( !res.is_constant( n ) && !res.is_ci( n ) )
+          CHECK( res.has_binding( n ) );
+      } );
+      /* functionally the same network */
+      default_simulator<kitty::dynamic_truth_table> sim( aig.num_pis() );
+      CHECK( simulate<kitty::dynamic_truth_table>( aig, sim ) == simulate<kitty::dynamic_truth_table>( res, sim ) );
+    }
+  }
+}
+
+TEST_CASE( "emap frontier with required times meets them or counts what it could not", "[emap][frontier]" )
+{
+  auto lib = frontier_lib();
+  aig_network aig = frontier_adder( 5 );
+  emap_params base;
+  emap_stats st_base;
+  emap_klut( aig, lib, base, &st_base );
+
+  emap_params ps;
+  ps.frontier_points = 6;
+  ps.required_time = static_cast<float>( st_base.delay * 1.5 ); /* slack to trade for area */
+  emap_stats st;
+  auto res = emap_klut( aig, lib, ps, &st );
+  REQUIRE( st.frontier_ran );
+  CHECK( st.frontier_delay_after <= ps.required_time + 1e-6 );
+  default_simulator<kitty::dynamic_truth_table> sim( aig.num_pis() );
+  CHECK( simulate<kitty::dynamic_truth_table>( aig, sim ) == simulate<kitty::dynamic_truth_table>( res, sim ) );
+}
+
+TEST_CASE( "emap frontier declines the shapes it does not model, and area mode skips it", "[emap][frontier]" )
+{
+  auto lib = frontier_lib();
+  aig_network aig = frontier_adder( 4 );
+  {
+    emap_params ps;
+    ps.frontier_points = 4;
+    ps.map_multioutput = true;
+    emap_stats st;
+    auto res = emap_klut( aig, lib, ps, &st );
+    CHECK_FALSE( st.frontier_ran );
+    CHECK_FALSE( st.frontier_declined.empty() );
+    default_simulator<kitty::dynamic_truth_table> sim( aig.num_pis() );
+    CHECK( simulate<kitty::dynamic_truth_table>( aig, sim ) == simulate<kitty::dynamic_truth_table>( res, sim ) );
+  }
+  {
+    emap_params ps;
+    ps.frontier_points = 4;
+    ps.frontier_mem_budget_mb = 1e-9;
+    emap_stats st;
+    emap_klut( aig, lib, ps, &st );
+    CHECK_FALSE( st.frontier_ran );
+    CHECK( st.frontier_declined.find( "budget" ) != std::string::npos );
+  }
+  {
+    emap_params ps;
+    ps.frontier_points = 4;
+    ps.area_oriented_mapping = true;
+    emap_stats st;
+    emap_klut( aig, lib, ps, &st );
+    CHECK_FALSE( st.frontier_ran );
+    CHECK( st.frontier_declined.empty() );
+  }
+}
+
+TEST_CASE( "emap frontier trades a leaf's slack for area on a multiplier", "[emap][frontier]" )
+{
+  /* A 10-bit array multiplier under the test library: the resolution moves covered nodes onto
+   * other cuts and keeps the result, at the entering delay, for a smaller area. */
+  auto lib = frontier_lib();
+  aig_network aig;
+  std::vector<aig_network::signal> a( 10 ), b( 10 );
+  std::generate( a.begin(), a.end(), [&]() { return aig.create_pi(); } );
+  std::generate( b.begin(), b.end(), [&]() { return aig.create_pi(); } );
+  for ( auto const& o : carry_ripple_multiplier( aig, a, b ) )
+    aig.create_po( o );
+  emap_params base;
+  emap_stats st_base;
+  emap_klut( aig, lib, base, &st_base );
+  emap_params ps;
+  ps.frontier_points = 8;
+  emap_stats st;
+  auto res = emap_klut( aig, lib, ps, &st );
+  REQUIRE( st.frontier_ran );
+  CHECK( st.frontier_kept );
+  CHECK( st.frontier_cut_changes > 0u );
+  CHECK( st.area < st_base.area );
+  CHECK( st.delay <= st_base.delay + 1e-6 );
+  default_simulator<kitty::dynamic_truth_table> sim( aig.num_pis() );
+  CHECK( simulate<kitty::dynamic_truth_table>( aig, sim ) == simulate<kitty::dynamic_truth_table>( res, sim ) );
+}

@@ -170,6 +170,35 @@ struct emap_params
    * identity) always competing. Off (default): byte-identical mapping. */
   bool cover_buffer{ false };
 
+  /*! \brief Frontier through the covering DP (delay-oriented mapping only). After area recovery,
+   * every node keeps a bounded Pareto frontier of (arrival, area-flow) points per output phase,
+   * built by merging its leaves' frontiers through EVERY cut and match -- not only the chosen cut,
+   * which is all `curve_points` re-binds within. A backward pass then resolves each node against
+   * its required time (the cheapest point that meets it), which fixes the node's cut and match and
+   * pushes a required time onto each leaf, so the cover can trade a slower, cheaper leaf for a
+   * faster match above it. One exact-area round cleans up after. 0 (default) = off, byte-identical.
+   * Hard-capped at `max_frontier_points`. */
+  uint32_t frontier_points{ 0 };
+
+  /*! \brief How a frontier point charges a leaf's cost: `flow` divides it by the blended reference
+   * estimate (area flow), `cover` by the entering cover's actual reference count -- a leaf the cover
+   * does not use pays its whole cost, which keeps the resolution from buying new, unshared logic
+   * on the strength of fanout that is not there. `cover` measured better on real libraries. */
+  enum class frontier_share_t
+  {
+    flow,
+    cover
+  };
+  frontier_share_t frontier_share{ frontier_share_t::cover };
+
+  /*! \brief Resolution rounds: each re-derives the sharing from the cover the previous round kept,
+   * and the loop stops at the first round that keeps nothing. Clamped to 1..8. */
+  uint32_t frontier_rounds{ 4 };
+
+  /*! \brief Memory ceiling for the frontier store, in MiB. Checked BEFORE allocation; a network
+   * over it keeps the ordinary cover and reports the decline. */
+  double frontier_mem_budget_mb{ 1024.0 };
+
   /*! \brief Compute area-oriented alternative matches */
   bool use_match_alternatives{ true };
 
@@ -214,6 +243,27 @@ struct emap_stats
   double load_curve_hi{ 0 };
   /*! \brief Bytes the curve store occupies (0 when inactive). */
   uint64_t load_curve_bytes{ 0 };
+
+  /*! \brief Frontier through the covering DP (`frontier_points`). `frontier_ran` says the round
+   * committed a cover; otherwise `frontier_declined` names why it did not (empty when the round was
+   * never requested or not applicable, e.g. an area-oriented run). */
+  bool frontier_ran{ false };
+  /*! \brief The resolved cover was kept: it met the entering cover's delay target at a smaller
+   * exact area. When false after a run, the entering cover was restored unchanged. */
+  bool frontier_kept{ false };
+  uint32_t frontier_rounds_kept{ 0 }; /* resolution rounds that were kept */
+  std::string frontier_declined{};
+  uint32_t frontier_nodes{ 0 };        /* nodes that carried a frontier */
+  uint32_t frontier_max_size{ 0 };     /* largest per-phase frontier kept */
+  uint32_t frontier_trimmed{ 0 };      /* per-phase frontiers the bound cut down */
+  uint64_t frontier_bytes{ 0 };        /* store size, computed before allocation */
+  uint32_t frontier_cut_changes{ 0 };  /* covered (node, phase)s resolved onto a different cut */
+  uint32_t frontier_gate_changes{ 0 }; /* covered (node, phase)s resolved onto a different match */
+  uint32_t frontier_unmet{ 0 };        /* demanded (node, phase)s no point could meet (fastest used) */
+  double frontier_area_before{ 0 };    /* cover area entering the round */
+  double frontier_area_after{ 0 };     /* after the resolution and its exact-area clean-up */
+  double frontier_delay_before{ 0 };
+  double frontier_delay_after{ 0 };
 
   double power{ 0 };
   /*! \brief Power result. */
@@ -1094,6 +1144,40 @@ private:
       {
         return false;
       }
+    }
+
+    /* frontier through the covering DP (opt-in; see emap_params::frontier_points) */
+    if ( ps.frontier_points > 0 && !ps.area_oriented_mapping )
+    {
+      uint32_t const rounds = std::max( 1u, std::min( ps.frontier_rounds, 8u ) );
+      double first_area = 0.0, first_delay = 0.0;
+      uint32_t cut_changes = 0, gate_changes = 0;
+      for ( uint32_t r = 0; r < rounds; ++r )
+      {
+        if ( !compute_mapping_frontier() )
+          return false;
+        if ( r == 0 )
+        {
+          first_area = st.frontier_area_before;
+          first_delay = st.frontier_delay_before;
+        }
+        if ( !st.frontier_ran || !st.frontier_kept )
+          break;
+        ++st.frontier_rounds_kept;
+        cut_changes += st.frontier_cut_changes;
+        gate_changes += st.frontier_gate_changes;
+      }
+      /* report the whole loop: from the cover it entered with to the one it leaves */
+      if ( st.frontier_rounds_kept > 0 )
+      {
+        st.frontier_kept = true;
+        st.frontier_area_after = area;
+        st.frontier_delay_after = frontier_current_delay();
+        st.frontier_cut_changes = cut_changes;
+        st.frontier_gate_changes = gate_changes;
+      }
+      st.frontier_area_before = first_area;
+      st.frontier_delay_before = first_delay;
     }
 
     return true;
@@ -2558,6 +2642,488 @@ private:
   }
 
   /* --- end electrical model --------------------------------------------------------------- */
+
+  /* --- frontier through the covering DP (emap_params::frontier_points) --------------------- */
+
+  /* One point of a node-phase frontier: implementing the phase this way can arrive at `arrival`
+   * for an estimated area-flow `cost` (the gate plus each leaf's cost shared over its estimated
+   * references). A `via_inv` point is the opposite phase's DIRECT point `cut`/`gate`/`polarity`
+   * plus the library inverter; it never refers to another via_inv point, so resolution cannot
+   * loop between phases. */
+  struct frontier_point
+  {
+    double arrival;
+    float cost;
+    supergate<NInputs> const* gate;
+    uint16_t cut;
+    uint16_t polarity;
+    bool via_inv;
+  };
+  using frontier_list = std::vector<frontier_point>;
+  std::vector<std::array<float, 2>> frontier_share;
+
+  /* Keep the non-dominated points, fastest first (cost strictly falling), then cut the list to
+   * `limit`: the fastest and the cheapest always stay, the rest are taken evenly by rank. The
+   * sort is stable over insertion order (cut order, then match order), so ties resolve the same
+   * way every run. */
+  bool frontier_prune( frontier_list& pts, uint32_t limit ) const
+  {
+    std::stable_sort( pts.begin(), pts.end(), []( frontier_point const& a, frontier_point const& b ) {
+      if ( a.arrival != b.arrival )
+        return a.arrival < b.arrival;
+      return a.cost < b.cost;
+    } );
+    frontier_list kept;
+    kept.reserve( pts.size() );
+    float best_cost = std::numeric_limits<float>::max();
+    for ( auto const& p : pts )
+    {
+      if ( p.cost < best_cost - epsilon )
+      {
+        kept.push_back( p );
+        best_cost = p.cost;
+      }
+    }
+    bool trimmed = false;
+    if ( kept.size() > limit )
+    {
+      frontier_list out;
+      out.reserve( limit );
+      std::size_t const n = kept.size();
+      std::size_t last = n; /* none yet */
+      for ( uint32_t j = 0; j < limit; ++j )
+      {
+        /* j = 0 is the fastest point, j = limit - 1 the cheapest */
+        std::size_t const at = ( j * ( n - 1 ) + ( limit - 1 ) / 2 ) / ( limit - 1 );
+        if ( at == last )
+          continue;
+        out.push_back( kept[at] );
+        last = at;
+      }
+      kept.swap( out );
+      trimmed = true;
+    }
+    pts.swap( kept );
+    return trimmed;
+  }
+
+  /* The frontier a consumer sees for (leaf, phase): a PI or constant is one fixed point (a negated
+   * PI costs the inverter, shared like any other leaf cost); an internal node is its own list. */
+  frontier_list const& frontier_of( uint32_t leaf, uint8_t phase, std::vector<std::array<frontier_list, 2>> const& fr,
+                                    frontier_list& scratch ) const
+  {
+    auto const n = ntk.index_to_node( leaf );
+    if ( ntk.is_pi( n ) || ntk.is_constant( n ) )
+    {
+      scratch.clear();
+      float const cost = ( ntk.is_pi( n ) && phase == 1 ) ? static_cast<float>( lib_inv_area ) : 0.0f;
+      scratch.push_back( frontier_point{ node_match[leaf].arrival[phase], cost, nullptr, 0, 0, false } );
+      return scratch;
+    }
+    return fr[leaf][phase];
+  }
+
+  /* Merge the leaves' frontiers through one match. Every leaf starts at its cheapest point; the
+   * merged arrival is the latest shifted leaf arrival, so the only way to be faster is to move
+   * every leaf that attains it to its next faster point. Each step emits one merged point, and the
+   * walk ends when a critical leaf has no faster point: O(sum of leaf frontier sizes). */
+  void frontier_merge_match( uint32_t index, uint8_t phase, supergate<NInputs> const& gate, uint16_t polarity,
+                             uint16_t cut_index, cut_t const& cut, std::vector<std::array<frontier_list, 2>> const& fr,
+                             frontier_list& out )
+  {
+    uint32_t const k = cut.size();
+    std::array<frontier_list const*, NInputs> lists{};
+    std::array<frontier_list, NInputs> scratch{};
+    std::array<double, NInputs> shift{};
+    std::array<float, NInputs> share{};
+    std::array<uint32_t, NInputs> at{};
+    uint32_t i = 0;
+    for ( auto l : cut )
+    {
+      uint8_t const lph = ( polarity >> i ) & 1;
+      lists[i] = &frontier_of( l, lph, fr, scratch[i] );
+      if ( lists[i]->empty() )
+        return; /* the leaf phase cannot be implemented: neither can this match */
+      shift[i] = gate_delay( &gate, i, index, phase );
+      share[i] = frontier_share[l][lph];
+      at[i] = static_cast<uint32_t>( lists[i]->size() - 1 ); /* cheapest */
+      ++i;
+    }
+    while ( true )
+    {
+      double t = 0.0;
+      float cost = static_cast<float>( gate.area );
+      for ( uint32_t j = 0; j < k; ++j )
+      {
+        auto const& p = ( *lists[j] )[at[j]];
+        t = std::max( t, p.arrival + shift[j] );
+        cost += p.cost / share[j];
+      }
+      if ( t >= std::numeric_limits<float>::max() )
+        return;
+      out.push_back( frontier_point{ t, cost, &gate, cut_index, polarity, false } );
+      bool moved = false;
+      for ( uint32_t j = 0; j < k; ++j )
+      {
+        if ( ( *lists[j] )[at[j]].arrival + shift[j] < t - epsilon )
+          continue; /* not critical */
+        if ( at[j] == 0 )
+          return; /* a critical leaf is already at its fastest point */
+        --at[j];
+        moved = true;
+      }
+      if ( !moved )
+        return;
+    }
+  }
+
+  /* Reference (leaf, phase) as one more consumer -- the per-leaf body of cut_ref, for a primary
+   * output, which has no cut of its own. */
+  void frontier_ref_signal( uint32_t leaf, uint8_t leaf_phase )
+  {
+    auto const n = ntk.index_to_node( leaf );
+    if ( ntk.is_constant( n ) )
+      return;
+    if ( ntk.is_pi( n ) )
+    {
+      ++node_match[leaf].map_refs[leaf_phase];
+      return;
+    }
+    auto& d = node_match[leaf];
+    if ( d.same_match )
+    {
+      if ( !d.map_refs[0] && !d.map_refs[1] )
+        cut_ref<false>( cuts[leaf][d.best_cut[leaf_phase]], n, leaf_phase );
+      ++d.map_refs[leaf_phase];
+    }
+    else if ( d.map_refs[leaf_phase]++ == 0u )
+    {
+      cut_ref<false>( cuts[leaf][d.best_cut[leaf_phase]], n, leaf_phase );
+    }
+  }
+
+  double frontier_current_delay() const
+  {
+    double worst = 0.0;
+    ntk.foreach_po( [&]( auto const& s ) {
+      auto const index = ntk.node_to_index( ntk.get_node( s ) );
+      worst = std::max( worst, node_match[index].arrival[ntk.is_complemented( s ) ? 1 : 0] );
+    } );
+    return worst;
+  }
+
+  bool compute_mapping_frontier()
+  {
+    /* Shapes this round does not model keep the ordinary cover, and say so. */
+    auto decline = [&]( char const* why ) {
+      st.frontier_declined = why;
+      return true;
+    };
+    if ( ps.map_multioutput )
+      return decline( "multi-output matching is on (a multi-output match has no per-phase frontier)" );
+    if ( ps.cover_buffer )
+      return decline( "cover-buffer is on (a chosen buffer is not a frontier point)" );
+    if ( ps.load_points > 1 )
+      return decline( "load-indexed curves are on (their arrivals are not scalar points)" );
+    if constexpr ( has_is_dont_touch_v<Ntk> )
+    {
+      bool boxed = false;
+      ntk.foreach_node( [&]( auto const& n ) { boxed = boxed || ntk.is_dont_touch( n ); } );
+      if ( boxed )
+        return decline( "the network holds dont-touch boxes" );
+    }
+
+    uint32_t const limit = std::max<uint32_t>( 2u, std::min( ps.frontier_points, max_frontier_points ) );
+    uint64_t const bytes = static_cast<uint64_t>( ntk.size() ) * 2u * limit * sizeof( frontier_point );
+    st.frontier_bytes = bytes;
+    if ( static_cast<double>( bytes ) > ps.frontier_mem_budget_mb * 1024.0 * 1024.0 )
+      return decline( "the frontier store exceeds frontier_mem_budget_mb" );
+
+    /* How many consumers share each leaf's cost: the CURRENT cover's reference count where the
+     * leaf is used (the sharing the resolution will mostly keep), the blended estimate where not. */
+    frontier_share.assign( ntk.size(), { 1.0f, 1.0f } );
+    for ( uint32_t i = 0; i < ntk.size(); ++i )
+      for ( uint8_t ph = 0; ph < 2; ++ph )
+        frontier_share[i][ph] = ps.frontier_share == emap_params::frontier_share_t::cover
+                                    ? std::max( 1.0f, static_cast<float>( node_match[i].map_refs[ph] ) )
+                                    : std::max( 1.0f, node_match[i].est_refs[ph] );
+
+    st.frontier_area_before = area;
+    st.frontier_delay_before = frontier_current_delay();
+    /* the entering cover, restored whole if the resolution does not improve on it */
+    auto const saved_match = node_match;
+    double const saved_area = area;
+    uint32_t const saved_inv = inv;
+
+    /* required times at the outputs of the CURRENT cover (the delay target the round keeps) */
+    delay = st.frontier_delay_before;
+    compute_required_time( true );
+    std::vector<std::array<double, 2>> po_req( ntk.size(), { std::numeric_limits<double>::max(), std::numeric_limits<double>::max() } );
+    ntk.foreach_po( [&]( auto const& s ) {
+      auto const index = ntk.node_to_index( ntk.get_node( s ) );
+      uint8_t const ph = ntk.is_complemented( s ) ? 1 : 0;
+      po_req[index][ph] = std::min<double>( po_req[index][ph], node_match[index].required[ph] );
+    } );
+
+    /* forward: per-node frontiers in topological order */
+    std::vector<std::array<frontier_list, 2>> fr( ntk.size() );
+    for ( auto const& n : topo_order )
+    {
+      if ( ntk.is_constant( n ) || ntk.is_pi( n ) )
+        continue;
+      uint32_t const index = ntk.node_to_index( n );
+      std::array<frontier_list, 2> direct;
+      for ( uint8_t ph = 0; ph < 2; ++ph )
+      {
+        uint16_t cut_index = 0;
+        for ( auto& cut : cuts[index] )
+        {
+          if ( ( *cut )->ignore || ( *cut )->supergates[ph] == nullptr )
+          {
+            ++cut_index;
+            continue;
+          }
+          auto const negation = ( *cut )->negations[ph];
+          frontier_list merged;
+          for ( auto const& gate : *( *cut )->supergates[ph] )
+            frontier_merge_match( index, ph, gate, static_cast<uint16_t>( gate.polarity ^ negation ), cut_index, *cut, fr, merged );
+          frontier_prune( merged, limit );
+          direct[ph].insert( direct[ph].end(), merged.begin(), merged.end() );
+          ++cut_index;
+        }
+        if ( frontier_prune( direct[ph], limit ) )
+          ++st.frontier_trimmed;
+      }
+      for ( uint8_t ph = 0; ph < 2; ++ph )
+      {
+        frontier_list all = direct[ph];
+        double const inv_delay = inv_delay_at( index, ph );
+        for ( auto const& p : direct[ph ^ 1] )
+          all.push_back( frontier_point{ p.arrival + inv_delay, p.cost + static_cast<float>( lib_inv_area ), p.gate, p.cut, p.polarity, true } );
+        if ( frontier_prune( all, limit ) )
+          ++st.frontier_trimmed;
+        st.frontier_max_size = std::max<uint32_t>( st.frontier_max_size, static_cast<uint32_t>( all.size() ) );
+        fr[index][ph].swap( all );
+      }
+      if ( !fr[index][0].empty() || !fr[index][1].empty() )
+        ++st.frontier_nodes;
+    }
+
+    /* backward: resolve each demanded (node, phase) against its required time */
+    struct decision
+    {
+      bool used[2]{ false, false };
+      frontier_point pick[2]{};   /* direct point per implemented phase */
+      int inverted{ -1 };         /* phase implemented as the other + inverter, or -1 */
+    };
+    std::vector<std::array<double, 2>> req = po_req;
+    std::vector<std::array<bool, 2>> demanded( ntk.size(), { false, false } );
+    ntk.foreach_po( [&]( auto const& s ) {
+      demanded[ntk.node_to_index( ntk.get_node( s ) )][ntk.is_complemented( s ) ? 1 : 0] = true;
+    } );
+    std::vector<decision> dec( ntk.size() );
+    auto cheapest_meeting = [&]( frontier_list const& pts, double r, bool& met ) -> frontier_point const* {
+      frontier_point const* best = nullptr;
+      for ( auto const& p : pts )
+      {
+        if ( p.via_inv )
+          continue;
+        if ( p.arrival <= r + epsilon && ( best == nullptr || p.cost < best->cost ) )
+          best = &p;
+      }
+      met = best != nullptr;
+      if ( best == nullptr ) /* nothing meets it: the fastest direct point */
+        for ( auto const& p : pts )
+          if ( !p.via_inv && ( best == nullptr || p.arrival < best->arrival ) )
+            best = &p;
+      return best;
+    };
+    uint32_t unmet = 0;
+    for ( auto it = topo_order.rbegin(); it != topo_order.rend(); ++it )
+    {
+      if ( ntk.is_constant( *it ) || ntk.is_pi( *it ) )
+        continue;
+      uint32_t const index = ntk.node_to_index( *it );
+      if ( !demanded[index][0] && !demanded[index][1] )
+        continue;
+      double const inf = std::numeric_limits<double>::max();
+      double const r0 = demanded[index][0] ? req[index][0] : inf;
+      double const r1 = demanded[index][1] ? req[index][1] : inf;
+
+      /* option: each demanded phase direct */
+      struct option
+      {
+        frontier_point const* p[2]{ nullptr, nullptr };
+        int inverted{ -1 };
+        bool met{ true };
+        float cost{ 0 };
+        bool ok{ true };
+      };
+      auto direct_option = [&]() {
+        option o;
+        for ( uint8_t ph = 0; ph < 2; ++ph )
+        {
+          if ( !demanded[index][ph] )
+            continue;
+          bool met = false;
+          o.p[ph] = cheapest_meeting( fr[index][ph], ph ? r1 : r0, met );
+          if ( o.p[ph] == nullptr )
+          {
+            o.ok = false;
+            return o;
+          }
+          o.met = o.met && met;
+          o.cost += o.p[ph]->cost;
+        }
+        return o;
+      };
+      /* option: `src` direct, the other phase from it through the inverter */
+      auto inverter_option = [&]( uint8_t src ) {
+        option o;
+        uint8_t const dst = src ^ 1;
+        double const need = std::min( src ? r1 : r0, ( dst ? r1 : r0 ) - inv_delay_at( index, dst ) );
+        bool met = false;
+        o.p[src] = cheapest_meeting( fr[index][src], need, met );
+        if ( o.p[src] == nullptr || !demanded[index][dst] )
+        {
+          o.ok = false;
+          return o;
+        }
+        o.met = met;
+        o.inverted = dst;
+        o.cost = o.p[src]->cost + static_cast<float>( lib_inv_area );
+        return o;
+      };
+      std::array<option, 3> opts{ direct_option(), inverter_option( 0 ), inverter_option( 1 ) };
+      option const* best = nullptr;
+      for ( auto const& o : opts )
+      {
+        if ( !o.ok )
+          continue;
+        if ( best == nullptr || ( o.met && !best->met ) || ( o.met == best->met && o.cost < best->cost - epsilon ) )
+          best = &o;
+      }
+      if ( best == nullptr )
+      {
+        st.frontier_declined = "a covered node has no implementable phase";
+        return true;
+      }
+      if ( !best->met )
+        ++unmet;
+
+      decision& d = dec[index];
+      d.inverted = best->inverted;
+      for ( uint8_t ph = 0; ph < 2; ++ph )
+      {
+        if ( best->p[ph] == nullptr )
+          continue;
+        d.used[ph] = true;
+        d.pick[ph] = *best->p[ph];
+        /* the phase's own requirement, tightened by the inverted phase it also feeds */
+        double r = ph ? r1 : r0;
+        if ( best->inverted == ( ph ^ 1 ) )
+          r = std::min( r, ( ph ? r0 : r1 ) - inv_delay_at( index, ph ^ 1 ) );
+        auto const& cut = cuts[index][d.pick[ph].cut];
+        uint32_t i = 0;
+        for ( auto l : cut )
+        {
+          uint8_t const lph = ( d.pick[ph].polarity >> i ) & 1;
+          req[l][lph] = std::min( req[l][lph], r - gate_delay( d.pick[ph].gate, i, index, ph ) );
+          demanded[l][lph] = true;
+          ++i;
+        }
+      }
+    }
+
+    /* apply: rewrite every resolved node, then rebuild references from the outputs down */
+    uint32_t cut_changes = 0, gate_changes = 0;
+    for ( auto const& n : topo_order )
+    {
+      if ( ntk.is_constant( n ) || ntk.is_pi( n ) )
+        continue;
+      uint32_t const index = ntk.node_to_index( n );
+      decision const& d = dec[index];
+      if ( !d.used[0] && !d.used[1] )
+        continue;
+      auto& nd = node_match[index];
+      for ( uint8_t ph = 0; ph < 2; ++ph )
+      {
+        if ( !d.used[ph] )
+          continue;
+        bool const was_live = nd.map_refs[ph] > 0 && nd.best_gate[ph] != nullptr;
+        if ( was_live && nd.best_cut[ph] != d.pick[ph].cut )
+          ++cut_changes;
+        else if ( was_live && nd.best_gate[ph] != d.pick[ph].gate )
+          ++gate_changes;
+        nd.best_gate[ph] = d.pick[ph].gate;
+        nd.best_cut[ph] = d.pick[ph].cut;
+        nd.phase[ph] = d.pick[ph].polarity;
+        nd.area[ph] = static_cast<float>( d.pick[ph].gate->area );
+        nd.flows[ph] = d.pick[ph].cost;
+      }
+      nd.multioutput_match[0] = nd.multioutput_match[1] = false;
+      if ( d.used[0] && d.used[1] )
+      {
+        nd.same_match = false;
+      }
+      else
+      {
+        /* one direct phase: the other (if demanded) is its complement through the inverter */
+        uint8_t const src = d.used[0] ? 0 : 1;
+        uint8_t const dst = src ^ 1;
+        nd.same_match = true;
+        nd.best_gate[dst] = nullptr;
+        nd.best_cut[dst] = nd.best_cut[src];
+        nd.phase[dst] = nd.phase[src];
+        nd.area[dst] = nd.area[src];
+      }
+    }
+    for ( auto& nd : node_match )
+      nd.map_refs[0] = nd.map_refs[1] = 0u;
+    ntk.foreach_po( [&]( auto const& s ) {
+      frontier_ref_signal( ntk.node_to_index( ntk.get_node( s ) ), ntk.is_complemented( s ) ? 1 : 0 );
+    } );
+    propagate_arrival_times();
+
+    /* exact-area clean-up against the resolved cover's own required times */
+    for ( uint32_t round = 0; round < std::max( 1u, ps.ela_rounds ); ++round )
+    {
+      delay = frontier_current_delay();
+      compute_required_time( true );
+      if ( !compute_mapping_exact_reversed<false>() )
+        return false;
+    }
+
+    st.frontier_ran = true;
+    st.frontier_cut_changes = cut_changes;
+    st.frontier_gate_changes = gate_changes;
+    st.frontier_unmet = unmet;
+    st.frontier_area_after = area;
+    st.frontier_delay_after = frontier_current_delay();
+
+    /* Keep the resolution only where it did what it is for: the same delay target (every output
+     * still meets the required time it entered with) at a smaller exact area. Otherwise the
+     * entering cover comes back unchanged and the stats say so. */
+    bool meets = unmet == 0u;
+    ntk.foreach_po( [&]( auto const& s ) {
+      auto const index = ntk.node_to_index( ntk.get_node( s ) );
+      uint8_t const ph = ntk.is_complemented( s ) ? 1 : 0;
+      if ( node_match[index].arrival[ph] > po_req[index][ph] + epsilon )
+        meets = false;
+    } );
+    st.frontier_kept = meets && area < saved_area - epsilon;
+    if ( !st.frontier_kept )
+    {
+      node_match = saved_match;
+      inv = saved_inv;
+      propagate_arrival_times(); /* restores loads, arrivals and area from the restored choices */
+      area = saved_area;
+    }
+    delay = frontier_current_delay();
+    return true;
+  }
+
+  /* --- end frontier ------------------------------------------------------------------------ */
 
   inline void match_propagate_required( uint32_t index )
   {
@@ -6782,6 +7348,7 @@ private:
   /* bounded per-node, per-phase area-delay frontier (`curve_points` only; empty otherwise). The
    * frontier school is the memory-hungry one, so the budget is hard-capped. */
   static constexpr uint32_t max_curve_points = 8;
+  static constexpr uint32_t max_frontier_points = 16;
   struct curve_set
   {
     std::array<best_gate_emap<NInputs>, max_curve_points> points{};
