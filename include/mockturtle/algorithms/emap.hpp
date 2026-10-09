@@ -33,6 +33,9 @@
 #pragma once
 
 #include <chrono>
+#include <cmath>
+#include <functional>
+#include <stdexcept>
 #include <cstdint>
 #include <limits>
 #include <string>
@@ -142,6 +145,11 @@ struct emap_params
 
   /*! \brief Wire capacitance charged per fanout edge in the electrical load estimate. */
   double wire_cap_per_fanout{ 0.0 };
+
+  /*! Optional total wire capacitance C(F), in the library's capacitance units.
+   * Driver excluded, output terminals included. Replaces the scalar when set.
+   * Total must be finite/nonnegative; a table need not be monotone. */
+  std::function<double(std::uint32_t)> wire_cap_for_fanout;
 
   /*! \brief Bounded per-node area-delay Pareto frontier (electrical model only). Each matched
    * node keeps up to this many non-dominated (arrival, area) points per phase, and at each
@@ -913,6 +921,8 @@ public:
         switch_activity( ps.eswp_rounds ? switching_activity( ntk, ps.switching_activity_patterns ) : std::vector<float>( 0 ) ),
         cuts( ntk.size() )
   {
+    if ( ps.wire_cap_for_fanout && ( !ps.electrical_model || ps.map_multioutput || ps.cover_buffer ) )
+      throw std::invalid_argument( "wire capacitance callback requires electrical single-output mapping without cover-buffer" );
     std::memset( node_tuple_match.data(), 0, sizeof( multioutput_info ) * ntk.size() );
     std::tie( lib_inv_area, lib_inv_delay, lib_inv_id ) = library.get_inverter_info();
     std::tie( lib_buf_area, lib_buf_delay, lib_buf_id ) = library.get_buffer_info();
@@ -937,6 +947,8 @@ public:
         switch_activity( switch_activity ),
         cuts( ntk.size() )
   {
+    if ( ps.wire_cap_for_fanout && ( !ps.electrical_model || ps.map_multioutput || ps.cover_buffer ) )
+      throw std::invalid_argument( "wire capacitance callback requires electrical single-output mapping without cover-buffer" );
     std::memset( node_tuple_match.data(), 0, sizeof( multioutput_info ) * ntk.size() );
     std::tie( lib_inv_area, lib_inv_delay, lib_inv_id ) = library.get_inverter_info();
     std::tie( lib_buf_area, lib_buf_delay, lib_buf_id ) = library.get_buffer_info();
@@ -2026,6 +2038,26 @@ private:
     return library.select_inverter( node_loads[index][inv_phase] );
   }
 
+  double wire_cap_at( uint32_t fanout ) const
+  {
+    double const cap = ps.wire_cap_for_fanout( fanout );
+    if ( !std::isfinite( cap ) || cap < 0.0 || cap > std::numeric_limits<float>::max() )
+      throw std::invalid_argument( "wire capacitance callback must return finite nonnegative mapper-range total capacitance" );
+    return cap;
+  }
+
+  float incremental_wire_cap( uint32_t index, uint8_t phase ) const
+  {
+    if ( !ps.wire_cap_for_fanout )
+      return static_cast<float>( ps.wire_cap_per_fanout );
+    uint32_t const count = node_fanouts[index][phase];
+    if ( count == std::numeric_limits<uint32_t>::max() )
+      throw std::overflow_error( "wire capacitance fanout count overflow" );
+    // A new sink REPLACES C(F) with C(F+1). The delta can be negative for
+    // legitimate nonmonotone Liberty tables; never clamp it to zero.
+    return static_cast<float>( wire_cap_at( count + 1 ) - wire_cap_at( count ) );
+  }
+
   /* --- load-indexed arrival curves (ADR-0050) ---------------------------------------------- */
 
   /* Build the ladder a node's arrival is sampled on and size the store. The anchors are library
@@ -2041,7 +2073,8 @@ private:
   {
     if ( !ps.electrical_model || ps.load_points < 2 )
       return;
-    float const wire = static_cast<float>( ps.wire_cap_per_fanout );
+    float const wire = ps.wire_cap_for_fanout ? static_cast<float>( wire_cap_at( 1 ) )
+                                               : static_cast<float>( ps.wire_cap_per_fanout );
     ladder = build_load_ladder( library.get_min_pin_cap() + wire, library.get_max_drive_load(),
                                 ps.load_points );
     if ( ladder.size < 2 )
@@ -2075,14 +2108,19 @@ private:
     if ( node_curves.empty() )
       return scalar;
     float const load = node_loads[leaf][leaf_phase] + extra_cap;
+    if ( ps.wire_cap_for_fanout && ( !std::isfinite( load ) || load < 0.0f ) )
+      throw std::invalid_argument( "nonlinear wire candidate load must remain finite nonnegative" );
     double const curved = interpolate_curve( ladder, node_curves[leaf][leaf_phase], load, scalar );
-    /* The query load is the leaf's own estimate PLUS a pin, and arrival rises with load, so a
+    /* Under the scalar wire estimate, query load is the leaf's own estimate PLUS a
+     * pin, and arrival rises with load, so a
      * curve can only ever answer at or above the scalar. Taking the max enforces that as an
      * invariant rather than trusting it: a curve that has not been refreshed yet (a node the
      * current round has not reached, a phase no match settled on) then answers exactly what the
      * scalar model would, which is conservative. Answering BELOW the scalar would be optimism
      * the rest of the mapper reconciles against and cannot absorb — required times derive from
      * these arrivals. */
+    if ( ps.wire_cap_for_fanout && extra_cap < 0.0f )
+      return curved; // a table decrease can outweigh the new sink's pin capacitance
     return curved > scalar ? curved : scalar;
   }
 
@@ -2092,7 +2130,7 @@ private:
   {
     if ( node_curves.empty() )
       return node_match[leaf].arrival[leaf_phase];
-    return leaf_arrival( leaf, leaf_phase, g->cap[ctr] + static_cast<float>( ps.wire_cap_per_fanout ) );
+    return leaf_arrival( leaf, leaf_phase, g->cap[ctr] + incremental_wire_cap( leaf, leaf_phase ) );
   }
 
   /* How much later this pin makes its leaf arrive: the load penalty the candidate imposes,
@@ -2216,10 +2254,17 @@ private:
      * cover's actual pin capacitances after the first round (update_node_loads) */
     float const seed_cap = library.get_median_pin_cap() + static_cast<float>( ps.wire_cap_per_fanout );
     node_loads.assign( ntk.size(), { { 0.0f, 0.0f } } );
+    if ( ps.wire_cap_for_fanout )
+      node_fanouts.assign( ntk.size(), { { 0u, 0u } } );
     ntk.foreach_node( [&]( auto const& n ) {
       uint32_t const index = ntk.node_to_index( n );
-      float const load = seed_cap * ntk.fanout_size( n );
+      uint32_t const count = ntk.fanout_size( n ); // network includes virtual output refs
+      float const load = ps.wire_cap_for_fanout
+                           ? library.get_median_pin_cap() * count + static_cast<float>( wire_cap_at( count ) )
+                           : seed_cap * count;
       node_loads[index][0] = node_loads[index][1] = load;
+      if ( ps.wire_cap_for_fanout )
+        node_fanouts[index][0] = node_fanouts[index][1] = count;
     } );
   }
 
@@ -2235,9 +2280,12 @@ private:
   {
     if ( !ps.electrical_model )
       return;
-    float const wire = static_cast<float>( ps.wire_cap_per_fanout );
+    float const wire = ps.wire_cap_for_fanout ? 0.0f : static_cast<float>( ps.wire_cap_per_fanout );
     for ( auto& l : node_loads )
       l[0] = l[1] = 0.0f;
+    if ( ps.wire_cap_for_fanout )
+      for ( auto& count : node_fanouts )
+        count[0] = count[1] = 0u;
 
     auto charge_cut = [&]( uint32_t index, uint8_t phase ) {
       auto const& node_data = node_match[index];
@@ -2250,6 +2298,8 @@ private:
           break;
         uint8_t const leaf_phase = ( node_data.phase[phase] >> ctr ) & 1;
         node_loads[leaf][leaf_phase] += sg->cap[ctr] + wire;
+        if ( ps.wire_cap_for_fanout )
+          ++node_fanouts[leaf][leaf_phase];
         ++ctr;
       }
     };
@@ -2264,7 +2314,11 @@ private:
       if ( ntk.is_pi( n ) )
       {
         if ( node_data.map_refs[1] > 0 )
+        {
           node_loads[index][0] += lib_inv_cap + wire; /* negated PI: an inverter reads the PI */
+          if ( ps.wire_cap_for_fanout )
+            ++node_fanouts[index][0];
+        }
         continue;
       }
       if constexpr ( has_is_dont_touch_v<Ntk> )
@@ -2285,13 +2339,29 @@ private:
         /* one cell serving both polarities: the materialized inverter's input loads the
          * implemented signal */
         if ( node_data.same_match && node_data.map_refs[use_phase ^ 1] > 0 )
+        {
           node_loads[index][use_phase] += lib_inv_cap + wire;
+          if ( ps.wire_cap_for_fanout )
+            ++node_fanouts[index][use_phase];
+        }
       }
       if ( !node_data.same_match && node_data.map_refs[use_phase ^ 1] > 0 &&
            node_data.best_gate[use_phase ^ 1] != nullptr )
       {
         charge_cut( index, use_phase ^ 1 );
       }
+    }
+
+    if ( ps.wire_cap_for_fanout )
+    {
+      ntk.foreach_po( [&]( auto const& signal ) {
+        uint32_t const index = ntk.node_to_index( ntk.get_node( signal ) );
+        uint8_t const phase = ntk.is_complemented( signal ) ? 1u : 0u;
+        ++node_fanouts[index][phase];
+      } );
+      for ( uint32_t index = 0; index < node_loads.size(); ++index )
+        for ( uint8_t phase = 0; phase < 2; ++phase )
+          node_loads[index][phase] += static_cast<float>( wire_cap_at( node_fanouts[index][phase] ) );
     }
 
     select_output_buffers();
@@ -7331,6 +7401,8 @@ private:
   float lib_inv_cap{ 0 };
   float lib_inv_slope{ 0 };
   std::vector<std::array<float, 2>> node_loads;
+  // Only allocated for the optional nonlinear model; tracks real sink pins and POs.
+  std::vector<std::array<uint32_t, 2>> node_fanouts;
 
   /* optional single-input covering stage (`cover_buffer` only; empty otherwise). One choice per
    * (node, phase): the selected buffer drive, or the identity (id == UINT32_MAX = no buffer). The
