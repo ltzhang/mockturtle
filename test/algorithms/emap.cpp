@@ -1710,3 +1710,276 @@ TEST_CASE( "emap frontier trades a leaf's slack for area on a multiplier", "[ema
   default_simulator<kitty::dynamic_truth_table> sim( aig.num_pis() );
   CHECK( simulate<kitty::dynamic_truth_table>( aig, sim ) == simulate<kitty::dynamic_truth_table>( res, sim ) );
 }
+
+TEST_CASE( "emap frontier rejects auxiliary memory outside the payload budget", "[emap][frontier][frontier-memory]" )
+{
+  auto lib = frontier_lib();
+  auto aig = frontier_adder( 64 );
+  emap_params ps;
+  ps.frontier_points = 4;
+  ps.frontier_rounds = 1;
+  emap_stats roomy;
+  emap_klut( aig, lib, ps, &roomy );
+  REQUIRE( roomy.frontier_ran );
+  /* Independent lower bound: the old payload allowance cannot also hold even the saved
+   * entering cover, before counting headers, resolution, sharing or temporary candidates. */
+  uint64_t const old_payload = uint64_t( aig.size() ) * 2 * 4 * 32;
+  ps.frontier_mem_budget_mb = ( old_payload + uint64_t( aig.size() ) * sizeof( detail::node_match_emap<3> ) / 2 ) / 1048576.0;
+  emap_stats tight;
+  auto actual = emap_klut( aig, lib, ps, &tight );
+  CHECK_FALSE( tight.frontier_ran );
+  CHECK( tight.frontier_declined.find( "budget" ) != std::string::npos );
+  emap_stats baseline;
+  auto expected = emap_klut( aig, lib, emap_params{}, &baseline );
+  CHECK( tight.area == baseline.area );
+  CHECK( tight.delay == baseline.delay );
+  REQUIRE( actual.size() == expected.size() );
+  actual.foreach_node( [&]( auto n ) {
+    CHECK( actual.has_binding( n ) == expected.has_binding( n ) );
+    if ( actual.has_binding( n ) )
+      CHECK( actual.get_binding_index( n ) == expected.get_binding_index( n ) );
+    CHECK( actual.node_function( n ) == expected.node_function( n ) );
+    std::vector<uint64_t> a, b;
+    actual.foreach_fanin( n, [&]( auto f ) { a.push_back( actual.node_to_index( actual.get_node( f ) ) ); } );
+    expected.foreach_fanin( n, [&]( auto f ) { b.push_back( expected.node_to_index( expected.get_node( f ) ) ); } );
+    CHECK( a == b );
+  } );
+}
+
+TEST_CASE( "emap frontier rejects nonfinite and overflowing budgets", "[emap][frontier][frontier-memory]" )
+{
+  auto lib = frontier_lib();
+  auto aig = frontier_adder( 4 );
+  for ( double budget : { -1.0, std::numeric_limits<double>::quiet_NaN(),
+                          std::numeric_limits<double>::infinity(), std::numeric_limits<double>::max() } )
+  {
+    emap_params ps;
+    ps.frontier_points = 4;
+    ps.frontier_mem_budget_mb = budget;
+    emap_stats st;
+    emap_klut( aig, lib, ps, &st );
+    INFO( "budget " << budget );
+    CHECK_FALSE( st.frontier_ran );
+    CHECK( st.frontier_declined.find( "budget" ) != std::string::npos );
+  }
+}
+
+TEST_CASE( "emap frontier admits exactly at its total byte boundary", "[emap][frontier][frontier-memory]" )
+{
+  auto lib = frontier_lib();
+  auto aig = frontier_adder( 128 );
+  emap_params ps;
+  ps.frontier_points = 8;
+  ps.frontier_rounds = 1;
+  emap_stats roomy;
+  emap_klut( aig, lib, ps, &roomy );
+  REQUIRE( roomy.frontier_ran );
+  CHECK( roomy.frontier_bytes == roomy.frontier_bytes_points + roomy.frontier_bytes_headers +
+                                     roomy.frontier_bytes_saved_matches + roomy.frontier_bytes_sharing +
+                                     roomy.frontier_bytes_resolution + roomy.frontier_bytes_scratch + roomy.frontier_bytes_allocator );
+  /* The copy of the entire entering cover is mandatory, independently of the point width. */
+  CHECK( roomy.frontier_bytes_saved_matches == uint64_t( aig.size() ) * sizeof( detail::node_match_emap<3> ) );
+  CHECK( roomy.frontier_bytes > roomy.frontier_bytes_points + roomy.frontier_bytes_saved_matches );
+  for ( int delta : { -1, 0, 1 } )
+  {
+    ps.frontier_mem_budget_mb = ( roomy.frontier_bytes + delta ) / 1048576.0;
+    emap_stats st;
+    emap_klut( aig, lib, ps, &st );
+    INFO( "delta " << delta );
+    CHECK( st.frontier_bytes == roomy.frontier_bytes );
+    CHECK( st.frontier_ran == ( delta >= 0 ) );
+    CHECK( st.frontier_declined.empty() == ( delta >= 0 ) );
+    if ( delta >= 0 )
+    {
+      CHECK( st.area == roomy.area );
+      CHECK( st.delay == roomy.delay );
+      CHECK( st.frontier_cut_changes == roomy.frontier_cut_changes );
+      CHECK( st.frontier_gate_changes == roomy.frontier_gate_changes );
+    }
+  }
+  emap_stats off;
+  emap_klut( aig, lib, emap_params{}, &off );
+  CHECK( off.frontier_bytes == 0 );
+  CHECK( off.frontier_bytes_scratch == 0 );
+}
+
+TEST_CASE( "emap bounded frontier preserves stable ties across epsilon", "[emap][frontier][frontier-memory]" )
+{
+  std::string const text = "GATE inv 1 O=!a; PIN * INV 1 999 0.9 0.3 0.9 0.3\n"
+                           "GATE nand 2 O=!(a*b); PIN * INV 1 999 1.0 0.2 1.0 0.2\n"
+                           "GATE and 3 O=a*b; PIN * INV 1 999 1.7 0.2 1.7 0.2\n"
+                           "GATE xor 4 O=a^b; PIN * UNKNOWN 2 999 1.9 0.5 1.9 0.5\n"
+                           "GATE maj 3 O=a*b+a*c+b*c; PIN * INV 1 999 2.0 0.2 2.0 0.2\n"
+                           "GATE buf 2 O=a; PIN * NONINV 1 999 1.0 0 1.0 0\n"
+                           "GATE zero 0 O=CONST0;\nGATE one 0 O=CONST1;\n";
+  std::vector<gate> gates;
+  std::istringstream in( text );
+  REQUIRE( lorina::read_genlib( in, genlib_reader( gates ) ) == lorina::return_code::success );
+  auto const original = gates;
+  for ( uint32_t variant = 0; variant < 4; ++variant )
+    for ( auto g : original )
+    {
+      g.name += std::to_string( variant );
+      g.id = gates.size();
+      /* Include an exact tie, then points on both sides of the mapper's 0.0005 epsilon. */
+      g.area += variant * 0.0004;
+      for ( auto& pin : g.pins )
+      {
+        pin.rise_block_delay += variant * 0.0004;
+        pin.fall_block_delay += variant * 0.0004;
+      }
+      gates.push_back( g );
+    }
+  tech_library<3> lib( gates );
+  aig_network aig;
+  std::vector<aig_network::signal> a( 10 ), b( 10 );
+  std::generate( a.begin(), a.end(), [&]() { return aig.create_pi(); } );
+  std::generate( b.begin(), b.end(), [&]() { return aig.create_pi(); } );
+  for ( auto o : carry_ripple_multiplier( aig, a, b ) )
+    aig.create_po( o );
+  emap_params ps;
+  ps.frontier_points = 8;
+  ps.frontier_rounds = 1;
+  emap_stats st;
+  auto res = emap_klut( aig, lib, ps, &st );
+  REQUIRE( st.frontier_kept );
+  /* Preserve the established result of the stable-prune covering contract, including
+   * match insertion order. A separate before/after probe also compares every binding. */
+  CHECK( st.frontier_cut_changes == 0 );
+  CHECK( st.frontier_gate_changes == 3 );
+  CHECK( st.area == Approx( 1244.0 ) );
+  CHECK( st.delay == Approx( 49.2 ) );
+  uint64_t bindings = 1469598103934665603ULL;
+  res.foreach_node( [&]( auto n ) {
+    if ( !res.has_binding( n ) )
+      return;
+    CHECK( res.get_binding_index( n ) < original.size() );
+    bindings = ( bindings ^ res.node_to_index( n ) ) * 1099511628211ULL;
+    bindings = ( bindings ^ res.get_binding_index( n ) ) * 1099511628211ULL;
+  } );
+  CHECK( bindings == 7119317494346797640ULL );
+  default_simulator<kitty::dynamic_truth_table> sim( aig.num_pis() );
+  CHECK( simulate<kitty::dynamic_truth_table>( aig, sim ) == simulate<kitty::dynamic_truth_table>( res, sim ) );
+}
+
+TEST_CASE( "emap frontier budgets deep reference traversal and zero-round cleanup", "[emap][frontier][frontier-memory]" )
+{
+  auto lib = frontier_lib();
+  aig_network aig;
+  std::vector<aig_network::signal> a( 256 ), b( 256 );
+  std::generate( a.begin(), a.end(), [&]() { return aig.create_pi(); } );
+  std::generate( b.begin(), b.end(), [&]() { return aig.create_pi(); } );
+  auto carry = aig.get_constant( false );
+  carry_ripple_adder_inplace( aig, a, b, carry );
+  aig.create_po( carry ); /* one deep cone; sum outputs cannot stop the reference traversal */
+  emap_params ps;
+  ps.frontier_points = 8;
+  ps.frontier_rounds = 1;
+  ps.ela_rounds = 0; /* entering tmp_visited has only its initial 100-entry reserve */
+  emap_stats st;
+  auto mapped = emap_klut( aig, lib, ps, &st );
+  REQUIRE( st.frontier_ran );
+  /* A visit log must cover each edge of up to two expanded phase implementations per
+   * node; this lower bound excludes the traversal frames and all other scratch. */
+  CHECK( st.frontier_bytes_scratch >= uint64_t( aig.size() ) * 2 * 6 * sizeof( uint64_t ) );
+  for ( unsigned pattern = 0; pattern < 64; ++pattern )
+  {
+    std::vector<bool> inputs( aig.num_pis() );
+    for ( unsigned i = 0; i < inputs.size(); ++i )
+      inputs[i] = ( ( i * 1664525u + pattern * 1013904223u ) >> ( pattern % 23 ) ) & 1;
+    default_simulator<bool> sim( inputs );
+    CHECK( simulate<bool>( aig, sim ) == simulate<bool>( mapped, sim ) );
+  }
+  ps.frontier_mem_budget_mb = ( st.frontier_bytes - 1 ) / 1048576.0;
+  emap_stats declined;
+  emap_klut( aig, lib, ps, &declined );
+  CHECK_FALSE( declined.frontier_ran );
+  CHECK( declined.frontier_declined.find( "budget" ) != std::string::npos );
+}
+
+TEST_CASE( "emap frontier cleanup does not retain extra verbose trace storage", "[emap][frontier][frontier-memory]" )
+{
+  auto lib = frontier_lib();
+  auto aig = frontier_adder( 64 );
+  emap_params ps;
+  ps.verbose = true;
+  ps.ela_rounds = 0;
+  emap_stats baseline;
+  emap_klut( aig, lib, ps, &baseline );
+  ps.frontier_points = 8;
+  ps.frontier_rounds = 1;
+  emap_stats st;
+  emap_klut( aig, lib, ps, &st );
+  REQUIRE( st.frontier_ran );
+  CHECK( st.round_stats.size() == baseline.round_stats.size() );
+}
+
+TEST_CASE( "emap iterative frontier references preserve shared diamonds and both phases", "[emap][frontier][frontier-memory]" )
+{
+  auto lib = frontier_lib();
+  aig_network aig;
+  auto a = aig.create_pi(), b = aig.create_pi(), c = aig.create_pi(), d = aig.create_pi();
+  auto shared = aig.create_xor( a, b );
+  auto left = aig.create_and( shared, c );
+  auto right = aig.create_or( shared, d );
+  auto diamond = aig.create_xor( left, right );
+  aig.create_po( diamond );
+  aig.create_po( !diamond );
+  aig.create_po( shared );
+  aig.create_po( !shared );
+  aig.create_po( aig.create_and( left, !right ) );
+  default_simulator<kitty::dynamic_truth_table> sim( aig.num_pis() );
+  auto const golden = simulate<kitty::dynamic_truth_table>( aig, sim );
+  for ( uint32_t cleanup : { 0u, 1u, 3u } )
+    for ( auto share : { emap_params::frontier_share_t::cover, emap_params::frontier_share_t::flow } )
+    {
+      emap_params ps;
+      ps.ela_rounds = cleanup;
+      emap_stats baseline;
+      emap_klut( aig, lib, ps, &baseline );
+      ps.frontier_points = 8;
+      ps.frontier_share = share;
+      emap_stats st;
+      auto mapped = emap_klut( aig, lib, ps, &st );
+      REQUIRE( st.frontier_ran );
+      CHECK( simulate<kitty::dynamic_truth_table>( mapped, sim ) == golden );
+      CHECK( st.area <= baseline.area + 1e-6 );
+      CHECK( st.delay <= baseline.delay + 1e-6 );
+    }
+}
+
+TEST_CASE( "emap frontier accounts allocator size classes and array headers", "[emap][frontier][frontier-memory]" )
+{
+  auto lib = frontier_lib();
+  auto aig = frontier_adder( 256 );
+  emap_params ps;
+  ps.frontier_points = 8;
+  ps.frontier_rounds = 1;
+  emap_stats st;
+  emap_klut( aig, lib, ps, &st );
+  REQUIRE( st.frontier_ran );
+  /* Mandatory point allocation alone crosses a power-of-two size class. The allocator
+   * contract includes 64 bytes for array header/padding before choosing that class. */
+  uint64_t bucket = 1;
+  while ( bucket < st.frontier_bytes_points + 64 )
+    bucket *= 2;
+  CHECK( st.frontier_bytes_allocator >= bucket - st.frontier_bytes_points + 4096 );
+}
+
+TEST_CASE( "emap frontier allocation bound rounds cookie before class and rejects overflow", "[emap][frontier][frontier-memory]" )
+{
+  uint64_t bound = 0;
+  REQUIRE( detail::frontier_allocation_bytes( 65536, bound ) );
+  CHECK( bound == 131072 + 4096 ); /* padded request crosses the 65536 class */
+  REQUIRE( detail::frontier_allocation_bytes( 0, bound ) );
+  CHECK( bound == 64 + 4096 ); /* new T[0] still calls the allocator */
+  REQUIRE( detail::frontier_allocation_bytes( 65472, bound ) );
+  CHECK( bound == 65536 + 4096 );
+  REQUIRE( detail::frontier_allocation_bytes( 65473, bound ) );
+  CHECK( bound == 131072 + 4096 );
+  CHECK_FALSE( detail::frontier_allocation_bytes( UINT64_MAX, bound ) );
+  CHECK_FALSE( detail::frontier_allocation_bytes( UINT64_MAX - 64, bound ) );
+  CHECK_FALSE( detail::frontier_allocation_bytes( uint64_t( 1 ) << 63, bound ) );
+  REQUIRE( detail::frontier_allocation_bytes( ( uint64_t( 1 ) << 63 ) - 64, bound ) );
+  CHECK( bound == ( uint64_t( 1 ) << 63 ) + 4096 );
+}
