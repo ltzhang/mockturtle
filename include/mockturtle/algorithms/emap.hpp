@@ -38,6 +38,10 @@
 #include <stdexcept>
 #include <cstdint>
 #include <limits>
+#include <memory>
+#include <cmath>
+#include <stdexcept>
+#include <type_traits>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -203,7 +207,7 @@ struct emap_params
    * and the loop stops at the first round that keeps nothing. Clamped to 1..8. */
   uint32_t frontier_rounds{ 4 };
 
-  /*! \brief Memory ceiling for the frontier store, in MiB. Checked BEFORE allocation; a network
+  /*! \brief Memory ceiling for total incremental frontier storage, in MiB. Checked BEFORE allocation; a network
    * over it keeps the ordinary cover and reports the decline. */
   double frontier_mem_budget_mb{ 1024.0 };
 
@@ -264,7 +268,14 @@ struct emap_stats
   uint32_t frontier_nodes{ 0 };        /* nodes that carried a frontier */
   uint32_t frontier_max_size{ 0 };     /* largest per-phase frontier kept */
   uint32_t frontier_trimmed{ 0 };      /* per-phase frontiers the bound cut down */
-  uint64_t frontier_bytes{ 0 };        /* store size, computed before allocation */
+  uint64_t frontier_bytes{ 0 };        /* total conservative incremental admission estimate */
+  uint64_t frontier_bytes_points{ 0 };
+  uint64_t frontier_bytes_headers{ 0 };
+  uint64_t frontier_bytes_saved_matches{ 0 };
+  uint64_t frontier_bytes_sharing{ 0 };
+  uint64_t frontier_bytes_resolution{ 0 };
+  uint64_t frontier_bytes_scratch{ 0 };
+  uint64_t frontier_bytes_allocator{ 0 }; /* page rounding + allocator allowance, not baseline RSS */
   uint32_t frontier_cut_changes{ 0 };  /* covered (node, phase)s resolved onto a different cut */
   uint32_t frontier_gate_changes{ 0 }; /* covered (node, phase)s resolved onto a different match */
   uint32_t frontier_unmet{ 0 };        /* demanded (node, phase)s no point could meet (fastest used) */
@@ -316,6 +327,28 @@ struct emap_stats
 
 namespace detail
 {
+
+/* Conservative per-array live allocation bound, qualified for glibc and mimalloc.
+ * Include up to 64 bytes of array cookie/alignment padding BEFORE size-class rounding,
+ * then one page for allocator metadata/rounding. This is not an arena or RSS bound. */
+inline bool frontier_allocation_bytes( uint64_t request, uint64_t& bytes )
+{
+  constexpr uint64_t maximum = std::numeric_limits<uint64_t>::max();
+  if ( request > maximum - 64 )
+    return false;
+  uint64_t const padded = request + 64;
+  uint64_t rounded = 1;
+  while ( rounded < padded )
+  {
+    if ( rounded > maximum / 2 )
+      return false;
+    rounded *= 2;
+  }
+  if ( rounded > maximum - 4096 )
+    return false;
+  bytes = rounded + 4096;
+  return true;
+}
 
 #pragma region cut set
 template<unsigned NInputs>
@@ -1879,7 +1912,7 @@ private:
   }
 
   template<bool SwitchActivity>
-  bool compute_mapping_exact_reversed()
+  bool compute_mapping_exact_reversed( bool record_stats = true )
   {
     for ( auto it = topo_order.rbegin(); it != topo_order.rend(); ++it )
     {
@@ -1972,7 +2005,7 @@ private:
     propagate_arrival_times();
 
     /* round stats */
-    if ( ps.verbose )
+    if ( ps.verbose && record_stats )
     {
       float area_gain = float( ( area_old - area ) / area_old * 100 );
       std::stringstream stats{};
@@ -2735,9 +2768,133 @@ private:
     uint16_t cut;
     uint16_t polarity;
     bool via_inv;
+    uint64_t order{ 0 }; /* stable tie order without stable_sort's unbounded temporary allocation */
   };
-  using frontier_list = std::vector<frontier_point>;
-  std::vector<std::array<float, 2>> frontier_share;
+
+  /* Non-owning bounded view. One exact-size point slab owns every stored frontier; candidate
+   * slabs are also sized at admission. No insertion can trigger hidden capacity growth. */
+  struct frontier_list
+  {
+    frontier_point* data{ nullptr };
+    std::size_t count{ 0 }, capacity{ 0 };
+    frontier_point* begin() const { return data; }
+    frontier_point* end() const { return count ? data + count : data; }
+    std::size_t size() const { return count; }
+    bool empty() const { return count == 0; }
+    void clear() { count = 0; }
+    frontier_point& operator[]( std::size_t i ) const { return data[i]; }
+    void push_back( frontier_point const& p )
+    {
+      if ( count == capacity )
+        throw std::length_error( "frontier candidate capacity exhausted" );
+      data[count++] = p;
+    }
+  };
+  struct frontier_decision
+  {
+    bool used[2]{ false, false };
+    frontier_point pick[2]{};
+    int inverted{ -1 };
+  };
+
+  /* Exact-size iterative DFS frames preserve recursive child-return float accumulation and
+   * the same-match increment AFTER the child returns. Only the opt-in round uses this path. */
+  struct frontier_walk_frame
+  {
+    cut_t const* cut{ nullptr };
+    uint32_t next{ 0 };
+    uint16_t polarity{ 0 };
+    float count{ 0 };
+    uint64_t pending{ std::numeric_limits<uint64_t>::max() };
+  };
+  enum class frontier_walk_mode
+  {
+    reference,
+    dereference,
+    visit
+  };
+  frontier_walk_frame* frontier_frames{ nullptr };
+  uint64_t* frontier_visits{ nullptr };
+  std::size_t frontier_frame_capacity{ 0 }, frontier_visit_capacity{ 0 }, frontier_visit_count{ 0 };
+
+  float frontier_cut_walk( cut_t const& root_cut, node<Ntk> const& root, uint8_t phase, frontier_walk_mode mode )
+  {
+    std::size_t depth = 0;
+    auto push = [&]( cut_t const& cut, uint32_t index, uint8_t ph ) {
+      if ( depth == frontier_frame_capacity )
+        throw std::length_error( "frontier traversal frame capacity exhausted" );
+      frontier_frames[depth++] = { &cut, 0, node_match[index].phase[ph], node_match[index].area[ph], std::numeric_limits<uint64_t>::max() };
+    };
+    auto add_reference = [&]( frontier_walk_frame& frame, uint32_t leaf, uint8_t ph ) {
+      auto& d = node_match[leaf];
+      if ( d.map_refs[ph]++ == 0u && d.best_gate[ph] == nullptr )
+        frame.count += lib_inv_area;
+    };
+    push( root_cut, ntk.node_to_index( root ), phase );
+    while ( depth )
+    {
+      auto& frame = frontier_frames[depth - 1];
+      if ( frame.pending != std::numeric_limits<uint64_t>::max() )
+      {
+        add_reference( frame, static_cast<uint32_t>( frame.pending >> 1 ), frame.pending & 1 );
+        frame.pending = std::numeric_limits<uint64_t>::max();
+      }
+      if ( frame.next == frame.cut->size() )
+      {
+        float const count = frame.count;
+        if ( --depth == 0 )
+          return count;
+        frontier_frames[depth - 1].count += count;
+        continue;
+      }
+      uint32_t const position = frame.next++;
+      uint32_t const leaf = *( frame.cut->begin() + position );
+      /* Polarity is captured from the current gate when its frame is pushed. */
+      uint8_t const ph = ( frame.polarity >> position ) & 1;
+      auto const n = ntk.index_to_node( leaf );
+      if ( ntk.is_constant( n ) )
+        continue;
+      if ( mode == frontier_walk_mode::visit )
+      {
+        if ( frontier_visit_count == frontier_visit_capacity )
+          throw std::length_error( "frontier visit log capacity exhausted" );
+        frontier_visits[frontier_visit_count++] = ( uint64_t( leaf ) << 1 ) | ph;
+      }
+      auto& d = node_match[leaf];
+      if ( ntk.is_pi( n ) )
+      {
+        bool const last = mode == frontier_walk_mode::dereference ? --d.map_refs[ph] == 0u : d.map_refs[ph]++ == 0u;
+        if ( ph && last )
+          frame.count += lib_inv_area;
+        continue;
+      }
+      bool descend = false;
+      if ( mode == frontier_walk_mode::dereference )
+      {
+        if ( d.same_match )
+        {
+          if ( --d.map_refs[ph] == 0u && d.best_gate[ph] == nullptr )
+            frame.count += lib_inv_area;
+          descend = !d.map_refs[0] && !d.map_refs[1];
+        }
+        else
+          descend = --d.map_refs[ph] == 0u;
+      }
+      else if ( d.same_match )
+      {
+        descend = !d.map_refs[0] && !d.map_refs[1];
+        if ( descend )
+          frame.pending = ( uint64_t( leaf ) << 1 ) | ph;
+        else
+          add_reference( frame, leaf, ph );
+      }
+      else
+        descend = d.map_refs[ph]++ == 0u;
+      if ( descend )
+        push( cuts[leaf][d.best_cut[ph]], leaf, ph );
+    }
+    return 0;
+  }
 
   /* Keep the non-dominated points, fastest first (cost strictly falling), then cut the list to
    * `limit`: the fastest and the cheapest always stay, the rest are taken evenly by rank. The
@@ -2745,48 +2902,45 @@ private:
    * way every run. */
   bool frontier_prune( frontier_list& pts, uint32_t limit ) const
   {
-    std::stable_sort( pts.begin(), pts.end(), []( frontier_point const& a, frontier_point const& b ) {
+    if ( pts.empty() )
+      return false;
+    for ( std::size_t i = 0; i < pts.size(); ++i )
+      pts[i].order = i;
+    std::sort( pts.begin(), pts.end(), []( frontier_point const& a, frontier_point const& b ) {
       if ( a.arrival != b.arrival )
         return a.arrival < b.arrival;
-      return a.cost < b.cost;
+      if ( a.cost != b.cost )
+        return a.cost < b.cost;
+      return a.order < b.order;
     } );
-    frontier_list kept;
-    kept.reserve( pts.size() );
+    std::size_t kept = 0;
     float best_cost = std::numeric_limits<float>::max();
-    for ( auto const& p : pts )
+    for ( std::size_t i = 0; i < pts.size(); ++i )
     {
-      if ( p.cost < best_cost - epsilon )
+      if ( pts[i].cost < best_cost - epsilon )
       {
-        kept.push_back( p );
-        best_cost = p.cost;
+        best_cost = pts[i].cost;
+        pts[kept++] = pts[i];
       }
     }
-    bool trimmed = false;
-    if ( kept.size() > limit )
+    bool const trimmed = kept > limit;
+    if ( trimmed )
     {
-      frontier_list out;
-      out.reserve( limit );
-      std::size_t const n = kept.size();
-      std::size_t last = n; /* none yet */
+      /* Selected source indices increase and are >= destination indices: safe in place. */
       for ( uint32_t j = 0; j < limit; ++j )
       {
-        /* j = 0 is the fastest point, j = limit - 1 the cheapest */
-        std::size_t const at = ( j * ( n - 1 ) + ( limit - 1 ) / 2 ) / ( limit - 1 );
-        if ( at == last )
-          continue;
-        out.push_back( kept[at] );
-        last = at;
+        std::size_t const at = ( uint64_t( j ) * ( kept - 1 ) + ( limit - 1 ) / 2 ) / ( limit - 1 );
+        pts[j] = pts[at];
       }
-      kept.swap( out );
-      trimmed = true;
+      kept = limit;
     }
-    pts.swap( kept );
+    pts.count = kept;
     return trimmed;
   }
 
   /* The frontier a consumer sees for (leaf, phase): a PI or constant is one fixed point (a negated
    * PI costs the inverter, shared like any other leaf cost); an internal node is its own list. */
-  frontier_list const& frontier_of( uint32_t leaf, uint8_t phase, std::vector<std::array<frontier_list, 2>> const& fr,
+  frontier_list const& frontier_of( uint32_t leaf, uint8_t phase, std::array<frontier_list, 2> const* fr,
                                     frontier_list& scratch ) const
   {
     auto const n = ntk.index_to_node( leaf );
@@ -2805,12 +2959,15 @@ private:
    * every leaf that attains it to its next faster point. Each step emits one merged point, and the
    * walk ends when a critical leaf has no faster point: O(sum of leaf frontier sizes). */
   void frontier_merge_match( uint32_t index, uint8_t phase, supergate<NInputs> const& gate, uint16_t polarity,
-                             uint16_t cut_index, cut_t const& cut, std::vector<std::array<frontier_list, 2>> const& fr,
-                             frontier_list& out )
+                             uint16_t cut_index, cut_t const& cut, std::array<frontier_list, 2> const* fr,
+                             frontier_list& out, std::array<float, 2> const* frontier_share )
   {
     uint32_t const k = cut.size();
     std::array<frontier_list const*, NInputs> lists{};
+    std::array<frontier_point, NInputs> scratch_points{};
     std::array<frontier_list, NInputs> scratch{};
+    for ( uint32_t j = 0; j < NInputs; ++j )
+      scratch[j] = { &scratch_points[j], 0, 1 };
     std::array<double, NInputs> shift{};
     std::array<float, NInputs> share{};
     std::array<uint32_t, NInputs> at{};
@@ -2911,14 +3068,117 @@ private:
     }
 
     uint32_t const limit = std::max<uint32_t>( 2u, std::min( ps.frontier_points, max_frontier_points ) );
-    uint64_t const bytes = static_cast<uint64_t>( ntk.size() ) * 2u * limit * sizeof( frontier_point );
-    st.frontier_bytes = bytes;
-    if ( static_cast<double>( bytes ) > ps.frontier_mem_budget_mb * 1024.0 * 1024.0 )
-      return decline( "the frontier store exceeds frontier_mem_budget_mb" );
+    /* Derive scratch capacities from existing cuts/matches, without allocating or mutating
+     * the entering cover. A match emits at most 1 + sum(leaf_size - 1) points. */
+    uint64_t merged_capacity = 0, direct_capacity = 0;
+    auto checked_add = []( uint64_t a, uint64_t b, uint64_t& result ) {
+      if ( b > std::numeric_limits<uint64_t>::max() - a )
+        return false;
+      result = a + b;
+      return true;
+    };
+    auto checked_mul = []( uint64_t a, uint64_t b, uint64_t& result ) {
+      if ( b && a > std::numeric_limits<uint64_t>::max() / b )
+        return false;
+      result = a * b;
+      return true;
+    };
+    for ( auto const& n : topo_order )
+    {
+      if ( ntk.is_constant( n ) || ntk.is_pi( n ) )
+        continue;
+      auto const index = ntk.node_to_index( n );
+      for ( uint8_t ph = 0; ph < 2; ++ph )
+      {
+        uint64_t phase_capacity = 0;
+        for ( auto const& cut : cuts[index] )
+        {
+          if ( ( *cut )->ignore || ( *cut )->supergates[ph] == nullptr )
+            continue;
+          uint64_t cap = 0;
+          if ( !checked_mul( ( *cut )->supergates[ph]->size(), 1 + uint64_t( cut->size() ) * ( limit - 1 ), cap ) ||
+               !checked_add( phase_capacity, limit, phase_capacity ) )
+            return decline( "frontier memory budget accounting overflow" );
+          merged_capacity = std::max( merged_capacity, cap );
+        }
+        direct_capacity = std::max( direct_capacity, phase_capacity );
+      }
+    }
+    uint64_t const nodes = ntk.size();
+    uint64_t point_count = 0, scratch_count = 0, visit_capacity = 0, walk_bytes = 0, visit_bytes = 0;
+    if ( !checked_mul( nodes, 2 * limit, point_count ) ||
+         !checked_mul( direct_capacity, 2, scratch_count ) ||
+         !checked_add( scratch_count, merged_capacity, scratch_count ) ||
+         !checked_add( scratch_count, 2 * limit, scratch_count ) ||
+         !checked_mul( point_count, sizeof( frontier_point ), st.frontier_bytes_points ) ||
+         !checked_mul( nodes, sizeof( std::array<frontier_list, 2> ), st.frontier_bytes_headers ) ||
+         !checked_mul( nodes, sizeof( node_match_emap<NInputs> ), st.frontier_bytes_saved_matches ) ||
+         !checked_mul( nodes, sizeof( std::array<float, 2> ), st.frontier_bytes_sharing ) ||
+         !checked_mul( nodes, 2 * sizeof( std::array<double, 2> ) + sizeof( std::array<bool, 2> ) + sizeof( frontier_decision ), st.frontier_bytes_resolution ) ||
+         !checked_mul( scratch_count, sizeof( frontier_point ), st.frontier_bytes_scratch ) )
+      return decline( "frontier memory budget accounting overflow" );
+    /* Each phase implementation expands at most once during a visit trial; every expanded
+     * cut adds at most CutSize leaf records. References prevent repeated shared expansion,
+     * including same_match after its DFS child returns. An acyclic path has <= nodes frames. */
+    if ( !checked_mul( nodes, 2 * uint64_t( CutSize ), visit_capacity ) ||
+         !checked_mul( visit_capacity, sizeof( uint64_t ), visit_bytes ) ||
+         !checked_mul( nodes, sizeof( frontier_walk_frame ), walk_bytes ) ||
+         !checked_add( st.frontier_bytes_scratch, visit_bytes, st.frontier_bytes_scratch ) ||
+         !checked_add( st.frontier_bytes_scratch, walk_bytes, st.frontier_bytes_scratch ) )
+      return decline( "frontier memory budget accounting overflow" );
+    /* Fixed allowance for local merge/resolve frames and allocation-free sort's logarithmic
+     * recursion. Fourteen exact-size heap arrays are rounded individually below, including
+     * array cookies/padding before size-class rounding. This is not a process-RSS limit;
+     * allocator arenas, pre-existing mapper/network memory and OS residency are excluded. */
+    if ( !checked_add( st.frontier_bytes_scratch, 16384 + uint64_t( NInputs ) * ( sizeof( frontier_point ) + sizeof( frontier_list ) + sizeof( frontier_list* ) + sizeof( double ) + sizeof( float ) + sizeof( uint32_t ) ), st.frontier_bytes_scratch ) )
+      return decline( "frontier memory budget accounting overflow" );
+    static_assert( alignof( frontier_point ) <= 64 && alignof( frontier_walk_frame ) <= 64 &&
+                       alignof( frontier_decision ) <= 64 && alignof( frontier_list ) <= 64 &&
+                       alignof( node_match_emap<NInputs> ) <= 64,
+                   "frontier array padding bound requires alignment <= 64" );
+    static_assert( std::is_trivially_destructible_v<frontier_point> &&
+                       std::is_trivially_destructible_v<frontier_walk_frame> &&
+                       std::is_trivially_destructible_v<frontier_decision> &&
+                       std::is_trivially_destructible_v<frontier_list> &&
+                       std::is_trivially_destructible_v<node_match_emap<NInputs>>,
+                   "frontier accounting assumes trivial array destruction" );
+    uint64_t req_bytes = 0, demand_bytes = 0, decision_bytes = 0, direct_bytes = 0, merged_bytes = 0;
+    if ( !checked_mul( nodes, sizeof( std::array<double, 2> ), req_bytes ) ||
+         !checked_mul( nodes, sizeof( std::array<bool, 2> ), demand_bytes ) ||
+         !checked_mul( nodes, sizeof( frontier_decision ), decision_bytes ) ||
+         !checked_mul( direct_capacity, sizeof( frontier_point ), direct_bytes ) ||
+         !checked_mul( merged_capacity, sizeof( frontier_point ), merged_bytes ) )
+      return decline( "frontier memory budget accounting overflow" );
+    std::array<uint64_t, 14> const allocation_requests{
+        st.frontier_bytes_sharing, st.frontier_bytes_saved_matches, req_bytes,
+        st.frontier_bytes_points, st.frontier_bytes_headers, direct_bytes, direct_bytes,
+        merged_bytes, uint64_t( 2 * limit ) * sizeof( frontier_point ), walk_bytes,
+        visit_bytes, req_bytes, demand_bytes, decision_bytes };
+    st.frontier_bytes_allocator = 0;
+    for ( auto request : allocation_requests )
+    {
+      uint64_t accounted = 0;
+      if ( !frontier_allocation_bytes( request, accounted ) ||
+           !checked_add( st.frontier_bytes_allocator, accounted - request, st.frontier_bytes_allocator ) )
+        return decline( "frontier memory budget accounting overflow" );
+    }
+    st.frontier_bytes = 0;
+    for ( uint64_t component : { st.frontier_bytes_points, st.frontier_bytes_headers,
+                                 st.frontier_bytes_saved_matches, st.frontier_bytes_sharing, st.frontier_bytes_resolution,
+                                 st.frontier_bytes_scratch, st.frontier_bytes_allocator } )
+      if ( !checked_add( st.frontier_bytes, component, st.frontier_bytes ) )
+        return decline( "frontier memory budget accounting overflow" );
+    long double const budget_bytes = static_cast<long double>( ps.frontier_mem_budget_mb ) * 1048576.0L;
+    if ( !std::isfinite( ps.frontier_mem_budget_mb ) || ps.frontier_mem_budget_mb < 0 ||
+         budget_bytes >= static_cast<long double>( std::numeric_limits<uint64_t>::max() ) )
+      return decline( "invalid or overflowing frontier_mem_budget_mb budget" );
+    if ( st.frontier_bytes > std::numeric_limits<std::size_t>::max() ||
+         static_cast<long double>( st.frontier_bytes ) > budget_bytes )
+      return decline( "total incremental frontier storage exceeds frontier_mem_budget_mb budget" );
 
-    /* How many consumers share each leaf's cost: the CURRENT cover's reference count where the
-     * leaf is used (the sharing the resolution will mostly keep), the blended estimate where not. */
-    frontier_share.assign( ntk.size(), { 1.0f, 1.0f } );
+    /* All owning arrays have exact extents. They die at round exit (including declines), so
+     * repeated rounds cannot overlap retained auxiliary capacity with the next admission. */
+    auto frontier_share = std::make_unique<std::array<float, 2>[]>( nodes );
     for ( uint32_t i = 0; i < ntk.size(); ++i )
       for ( uint8_t ph = 0; ph < 2; ++ph )
         frontier_share[i][ph] = ps.frontier_share == emap_params::frontier_share_t::cover
@@ -2928,14 +3188,16 @@ private:
     st.frontier_area_before = area;
     st.frontier_delay_before = frontier_current_delay();
     /* the entering cover, restored whole if the resolution does not improve on it */
-    auto const saved_match = node_match;
+    auto saved_match = std::make_unique<node_match_emap<NInputs>[]>( nodes );
+    std::copy( node_match.begin(), node_match.end(), saved_match.get() );
     double const saved_area = area;
     uint32_t const saved_inv = inv;
 
     /* required times at the outputs of the CURRENT cover (the delay target the round keeps) */
     delay = st.frontier_delay_before;
     compute_required_time( true );
-    std::vector<std::array<double, 2>> po_req( ntk.size(), { std::numeric_limits<double>::max(), std::numeric_limits<double>::max() } );
+    auto po_req = std::make_unique<std::array<double, 2>[]>( nodes );
+    std::fill_n( po_req.get(), nodes, std::array<double, 2>{ std::numeric_limits<double>::max(), std::numeric_limits<double>::max() } );
     ntk.foreach_po( [&]( auto const& s ) {
       auto const index = ntk.node_to_index( ntk.get_node( s ) );
       uint8_t const ph = ntk.is_complemented( s ) ? 1 : 0;
@@ -2943,13 +3205,28 @@ private:
     } );
 
     /* forward: per-node frontiers in topological order */
-    std::vector<std::array<frontier_list, 2>> fr( ntk.size() );
+    auto points = std::make_unique<frontier_point[]>( point_count );
+    auto fr = std::make_unique<std::array<frontier_list, 2>[]>( nodes );
+    for ( uint64_t i = 0; i < nodes; ++i )
+      for ( uint8_t ph = 0; ph < 2; ++ph )
+        fr[i][ph] = { points.get() + ( 2 * i + ph ) * limit, 0, limit };
+    auto direct_points0 = std::make_unique<frontier_point[]>( direct_capacity );
+    auto direct_points1 = std::make_unique<frontier_point[]>( direct_capacity );
+    auto merged_points = std::make_unique<frontier_point[]>( merged_capacity );
+    auto all_points = std::make_unique<frontier_point[]>( 2 * limit );
+    auto walk_frames = std::make_unique<frontier_walk_frame[]>( nodes );
+    auto visit_log = std::make_unique<uint64_t[]>( visit_capacity );
+    std::array<frontier_list, 2> direct{ frontier_list{ direct_points0.get(), 0, direct_capacity },
+                                         frontier_list{ direct_points1.get(), 0, direct_capacity } };
+    frontier_list merged{ merged_points.get(), 0, merged_capacity };
+    frontier_list all{ all_points.get(), 0, 2 * limit };
     for ( auto const& n : topo_order )
     {
       if ( ntk.is_constant( n ) || ntk.is_pi( n ) )
         continue;
       uint32_t const index = ntk.node_to_index( n );
-      std::array<frontier_list, 2> direct;
+      direct[0].clear();
+      direct[1].clear();
       for ( uint8_t ph = 0; ph < 2; ++ph )
       {
         uint16_t cut_index = 0;
@@ -2961,11 +3238,12 @@ private:
             continue;
           }
           auto const negation = ( *cut )->negations[ph];
-          frontier_list merged;
+          merged.clear();
           for ( auto const& gate : *( *cut )->supergates[ph] )
-            frontier_merge_match( index, ph, gate, static_cast<uint16_t>( gate.polarity ^ negation ), cut_index, *cut, fr, merged );
+            frontier_merge_match( index, ph, gate, static_cast<uint16_t>( gate.polarity ^ negation ), cut_index, *cut, fr.get(), merged, frontier_share.get() );
           frontier_prune( merged, limit );
-          direct[ph].insert( direct[ph].end(), merged.begin(), merged.end() );
+          for ( auto const& p : merged )
+            direct[ph].push_back( p );
           ++cut_index;
         }
         if ( frontier_prune( direct[ph], limit ) )
@@ -2973,32 +3251,30 @@ private:
       }
       for ( uint8_t ph = 0; ph < 2; ++ph )
       {
-        frontier_list all = direct[ph];
+        all.clear();
+        for ( auto const& p : direct[ph] )
+          all.push_back( p );
         double const inv_delay = inv_delay_at( index, ph );
         for ( auto const& p : direct[ph ^ 1] )
           all.push_back( frontier_point{ p.arrival + inv_delay, p.cost + static_cast<float>( lib_inv_area ), p.gate, p.cut, p.polarity, true } );
         if ( frontier_prune( all, limit ) )
           ++st.frontier_trimmed;
         st.frontier_max_size = std::max<uint32_t>( st.frontier_max_size, static_cast<uint32_t>( all.size() ) );
-        fr[index][ph].swap( all );
+        for ( auto const& p : all )
+          fr[index][ph].push_back( p );
       }
       if ( !fr[index][0].empty() || !fr[index][1].empty() )
         ++st.frontier_nodes;
     }
 
     /* backward: resolve each demanded (node, phase) against its required time */
-    struct decision
-    {
-      bool used[2]{ false, false };
-      frontier_point pick[2]{};   /* direct point per implemented phase */
-      int inverted{ -1 };         /* phase implemented as the other + inverter, or -1 */
-    };
-    std::vector<std::array<double, 2>> req = po_req;
-    std::vector<std::array<bool, 2>> demanded( ntk.size(), { false, false } );
+    auto req = std::make_unique<std::array<double, 2>[]>( nodes );
+    std::copy_n( po_req.get(), nodes, req.get() );
+    auto demanded = std::make_unique<std::array<bool, 2>[]>( nodes );
     ntk.foreach_po( [&]( auto const& s ) {
       demanded[ntk.node_to_index( ntk.get_node( s ) )][ntk.is_complemented( s ) ? 1 : 0] = true;
     } );
-    std::vector<decision> dec( ntk.size() );
+    auto dec = std::make_unique<frontier_decision[]>( nodes );
     auto cheapest_meeting = [&]( frontier_list const& pts, double r, bool& met ) -> frontier_point const* {
       frontier_point const* best = nullptr;
       for ( auto const& p : pts )
@@ -3082,13 +3358,13 @@ private:
       }
       if ( best == nullptr )
       {
-        st.frontier_declined = "a covered node has no implementable phase";
-        return true;
+        std::copy_n( saved_match.get(), nodes, node_match.begin() );
+        return decline( "a covered node has no implementable phase" );
       }
       if ( !best->met )
         ++unmet;
 
-      decision& d = dec[index];
+      frontier_decision& d = dec[index];
       d.inverted = best->inverted;
       for ( uint8_t ph = 0; ph < 2; ++ph )
       {
@@ -3112,6 +3388,24 @@ private:
       }
     }
 
+    /* Use bounded iterative references for BOTH rebuilding and every exact-cleanup trial.
+     * Scoped reset also protects mapper state on errors or early exits. */
+    struct workspace_reset
+    {
+      emap_impl& owner;
+      ~workspace_reset()
+      {
+        owner.frontier_frames = nullptr;
+        owner.frontier_visits = nullptr;
+        owner.frontier_frame_capacity = owner.frontier_visit_capacity = owner.frontier_visit_count = 0;
+      }
+    } reset{ *this };
+    frontier_frames = walk_frames.get();
+    frontier_visits = visit_log.get();
+    frontier_frame_capacity = nodes;
+    frontier_visit_capacity = visit_capacity;
+    frontier_visit_count = 0;
+
     /* apply: rewrite every resolved node, then rebuild references from the outputs down */
     uint32_t cut_changes = 0, gate_changes = 0;
     for ( auto const& n : topo_order )
@@ -3119,7 +3413,7 @@ private:
       if ( ntk.is_constant( n ) || ntk.is_pi( n ) )
         continue;
       uint32_t const index = ntk.node_to_index( n );
-      decision const& d = dec[index];
+      frontier_decision const& d = dec[index];
       if ( !d.used[0] && !d.used[1] )
         continue;
       auto& nd = node_match[index];
@@ -3167,7 +3461,7 @@ private:
     {
       delay = frontier_current_delay();
       compute_required_time( true );
-      if ( !compute_mapping_exact_reversed<false>() )
+      if ( !compute_mapping_exact_reversed<false>( false ) )
         return false;
     }
 
@@ -3191,7 +3485,7 @@ private:
     st.frontier_kept = meets && area < saved_area - epsilon;
     if ( !st.frontier_kept )
     {
-      node_match = saved_match;
+      std::copy_n( saved_match.get(), nodes, node_match.begin() );
       inv = saved_inv;
       propagate_arrival_times(); /* restores loads, arrivals and area from the restored choices */
       area = saved_area;
@@ -5475,6 +5769,8 @@ private:
   template<bool SwitchActivity>
   float cut_ref( cut_t const& cut, node<Ntk> const& n, uint8_t phase )
   {
+    if constexpr ( !SwitchActivity )
+      if ( frontier_frames ) return frontier_cut_walk( cut, n, phase, frontier_walk_mode::reference );
     auto const& node_data = node_match[ntk.node_to_index( n )];
     float count;
 
@@ -5555,6 +5851,9 @@ private:
   template<bool SwitchActivity>
   float cut_deref( cut_t const& cut, node<Ntk> const& n, uint8_t phase )
   {
+    if constexpr ( !SwitchActivity )
+      if ( frontier_frames )
+        return frontier_cut_walk( cut, n, phase, frontier_walk_mode::dereference );
     auto const& node_data = node_match[ntk.node_to_index( n )];
     float count;
 
@@ -5634,6 +5933,17 @@ private:
   template<bool SwitchActivity>
   float cut_measure_mffc( cut_t const& cut, node<Ntk> const& n, uint8_t phase )
   {
+    if constexpr ( !SwitchActivity )
+    {
+      if ( frontier_frames )
+      {
+        frontier_visit_count = 0;
+        float const count = frontier_cut_walk( cut, n, phase, frontier_walk_mode::visit );
+        for ( std::size_t i = 0; i < frontier_visit_count; ++i )
+          --node_match[frontier_visits[i] >> 1].map_refs[frontier_visits[i] & 1];
+        return count;
+      }
+    }
     tmp_visited.clear();
 
     float count = cut_ref_visit<SwitchActivity>( cut, n, phase );
@@ -5651,6 +5961,9 @@ private:
   template<bool SwitchActivity>
   float cut_ref_visit( cut_t const& cut, node<Ntk> const& n, uint8_t phase )
   {
+    if constexpr ( !SwitchActivity )
+      if ( frontier_frames )
+        return frontier_cut_walk( cut, n, phase, frontier_walk_mode::visit );
     auto const& node_data = node_match[ntk.node_to_index( n )];
     float count;
 
