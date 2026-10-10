@@ -132,7 +132,7 @@ private:
     stopwatch<> t( time_sop );
     inverted = false;
 
-    if ( auto it = sop_hash_.find( func ); it != sop_hash_.end() )
+    if ( auto it = sop_hash_.find( func ); cache_sops_ && it != sop_hash_.end() )
     {
       sop_cache_hits++;
       return it->second;
@@ -140,7 +140,7 @@ private:
 
     if ( both_phases_ )
     {
-      if ( auto it = sop_hash_.find( ~func ); it != sop_hash_.end() )
+      if ( auto it = sop_hash_.find( ~func ); cache_sops_ && it != sop_hash_.end() )
       {
         inverted = true;
         sop_cache_hits++;
@@ -158,7 +158,7 @@ private:
       if ( n_sop.size() < sop.size() )
       {
         inverted = true;
-        return sop_hash_[~func] = n_sop;
+        return cache_sops_ ? sop_hash_[~func] = n_sop : n_sop;
       }
       else if ( n_sop.size() == sop.size() )
       {
@@ -176,12 +176,12 @@ private:
         if ( n_lit < lit )
         {
           inverted = true;
-          return sop_hash_[~func] = n_sop;
+          return cache_sops_ ? sop_hash_[~func] = n_sop : n_sop;
         }
       }
     }
 
-    return sop_hash_[func] = sop;
+    return cache_sops_ ? sop_hash_[func] = sop : sop;
   }
 
 private:
@@ -189,6 +189,8 @@ private:
 
 public:
   bool both_phases_{ false };
+  /*! Disable memoization when the caller budgets only bounded per-cut scratch. */
+  bool cache_sops_{ true };
 
 public:
   mutable uint32_t sop_cache_hits{};

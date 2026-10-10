@@ -106,17 +106,18 @@ namespace detail
 template<class Ntk, class CostFn>
 struct balancing_impl
 {
-  balancing_impl( Ntk const& ntk, rebalancing_function_t<Ntk> const& rebalancing_fn, balancing_params const& ps, balancing_stats& st )
+  balancing_impl( Ntk const& ntk, rebalancing_function_t<Ntk> const& rebalancing_fn, balancing_params const& ps, balancing_stats& st, std::function<Ntk( Ntk const& )> const& make_network )
       : ntk_( ntk ),
         rebalancing_fn_( rebalancing_fn ),
         ps_( ps ),
-        st_( st )
+        st_( st ),
+        make_network_( make_network )
   {
   }
 
   Ntk run()
   {
-    Ntk dest;
+    Ntk dest = make_network_ ? make_network_( ntk_ ) : Ntk{};
     node_map<arrival_time_pair<Ntk>, Ntk> old_to_new( ntk_ );
 
     /* input arrival times and mapping */
@@ -189,6 +190,10 @@ struct balancing_impl
       dest.create_po( ntk_.is_complemented( f ) ? dest.create_not( s ) : s );
     } );
 
+    if ( make_network_ )
+    {
+      return cleanup_dangling<Ntk, Ntk>( dest, false, false, [&]() { return make_network_( dest ); } );
+    }
     return cleanup_dangling( dest );
   }
 
@@ -197,6 +202,7 @@ private:
   rebalancing_function_t<Ntk> const& rebalancing_fn_;
   balancing_params const& ps_;
   balancing_stats& st_;
+  std::function<Ntk( Ntk const& )> const& make_network_;
 };
 
 template<class Ntk>
@@ -289,6 +295,11 @@ private:
  * size for rewriting candidates is computed by the rebalancing function and
  * may not correspond to the cost given by CostFn.
  *
+ * The optional make_network factory constructs each private destination before
+ * other scratch allocation. It receives the original source first and the
+ * candidate source at final cleanup, allowing callers to admit both live copies.
+ * Exceptions from admission propagate without publishing a partial destination.
+ *
    \verbatim embed:rst
 
    Example
@@ -304,7 +315,7 @@ private:
    \endverbatim
  */
 template<class Ntk, class CostFn = unit_cost<Ntk>>
-Ntk balancing( Ntk const& ntk, rebalancing_function_t<Ntk> const& rebalancing_fn = {}, balancing_params const& ps = {}, balancing_stats* pst = nullptr )
+Ntk balancing( Ntk const& ntk, rebalancing_function_t<Ntk> const& rebalancing_fn = {}, balancing_params const& ps = {}, balancing_stats* pst = nullptr, std::function<Ntk( Ntk const& )> const& make_network = {} )
 {
   static_assert( is_network_type_v<Ntk>, "Ntk is not a network type" );
   static_assert( has_create_not_v<Ntk>, "Ntk does not implement the create_not method" );
@@ -321,7 +332,7 @@ Ntk balancing( Ntk const& ntk, rebalancing_function_t<Ntk> const& rebalancing_fn
   static_assert( has_size_v<Ntk>, "Ntk does not implement the size method" );
 
   balancing_stats st;
-  const auto dest = detail::balancing_impl<Ntk, CostFn>{ ntk, rebalancing_fn, ps, st }.run();
+  const auto dest = detail::balancing_impl<Ntk, CostFn>{ ntk, rebalancing_fn, ps, st, make_network }.run();
 
   if ( pst )
   {

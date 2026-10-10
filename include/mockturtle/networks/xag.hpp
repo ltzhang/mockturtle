@@ -41,6 +41,10 @@
 
 #pragma once
 
+#include <functional>
+#include <limits>
+#include <stdexcept>
+
 #include <memory>
 #include <optional>
 #include <stack>
@@ -182,6 +186,42 @@ public:
   {
   }
 
+  /*! Admission for append-only construction (constructor and create_pi/po/gates).
+   * Allocation payloads exclude allocator bookkeeping. The peak includes both
+   * old and new buffers during reserve. A callback may throw to refuse growth
+   * before any vector, hash, fanout, or interface state is changed. Substitution,
+   * deletion, cloning, and direct storage access are outside this build guard. */
+  struct allocation_projection
+  {
+    size_t resident_bytes;
+    size_t peak_bytes;
+    size_t nodes;
+  };
+  using allocation_callback = std::function<void( allocation_projection const& )>;
+
+  explicit xag_network( allocation_callback callback )
+      : _storage( make_guarded_storage( callback ) ),
+        _events( std::make_shared<decltype( _events )::element_type>() ),
+        _allocation_callback( std::move( callback ) )
+  {
+  }
+
+  void clear_allocation_callback() { _allocation_callback = {}; }
+
+  size_t allocated_bytes() const
+  {
+    return object_bytes() + _storage->nodes.capacity() * sizeof( xag_storage::node_type ) +
+           _storage->inputs.capacity() * sizeof( uint64_t ) +
+           _storage->outputs.capacity() * sizeof( xag_storage::node_type::pointer_type ) +
+           hash_debug::AllocatedByteSize( _storage->hash );
+  }
+
+  static size_t initial_allocated_bytes()
+  {
+    return object_bytes() + 10000u * sizeof( xag_storage::node_type ) +
+           hash_debug::LowerBoundAllocatedByteSize( 10000u );
+  }
+
   xag_network( std::shared_ptr<xag_storage> storage )
       : _storage( storage ),
         _events( std::make_shared<decltype( _events )::element_type>() )
@@ -203,6 +243,11 @@ public:
   signal create_pi()
   {
     const auto index = _storage->nodes.size();
+    if ( _allocation_callback )
+    {
+      reserve_guarded( next_capacity( _storage->nodes ), next_capacity( _storage->inputs ),
+                       _storage->outputs.capacity(), 0u, index + 1u );
+    }
     auto& node = _storage->nodes.emplace_back();
     node.children[0].data = node.children[1].data = _storage->inputs.size();
     node.data[1].h2 = 1; // mark as PI
@@ -212,6 +257,11 @@ public:
 
   uint32_t create_po( signal const& f )
   {
+    if ( _allocation_callback )
+    {
+      reserve_guarded( _storage->nodes.capacity(), _storage->inputs.capacity(),
+                       next_capacity( _storage->outputs ), 0u, _storage->nodes.size() );
+    }
     /* increase ref-count to children */
     _storage->nodes[f.index].data[0].h1++;
     auto const po_index = static_cast<uint32_t>( _storage->outputs.size() );
@@ -274,7 +324,17 @@ public:
 
     const auto index = _storage->nodes.size();
 
-    if ( index >= .9 * _storage->nodes.capacity() )
+    if ( _allocation_callback )
+    {
+      const auto grow = index >= .9 * _storage->nodes.capacity();
+      const auto target = grow ? static_cast<size_t>( 3.1415f * index ) : _storage->nodes.capacity();
+      // PI growth can leave the hash smaller than the node vector. Reserve for
+      // insertion explicitly as well, so implicit hash growth cannot bypass admission.
+      const auto hash_target = grow ? target : _storage->hash.size() + 1u;
+      reserve_guarded( target, _storage->inputs.capacity(), _storage->outputs.capacity(),
+                       hash_target, index + 1u );
+    }
+    else if ( index >= .9 * _storage->nodes.capacity() )
     {
       _storage->nodes.reserve( static_cast<uint64_t>( 3.1415f * index ) );
       _storage->hash.reserve( static_cast<uint64_t>( 3.1415f * index ) );
@@ -1260,9 +1320,71 @@ public:
   }
 #pragma endregion
 
+private:
+  using hash_type = decltype( xag_storage::hash );
+  using hash_debug = phmap::priv::hashtable_debug_internal::HashtableDebugAccess<hash_type>;
+
+  static constexpr size_t object_bytes()
+  {
+    return sizeof( xag_storage ) + sizeof( network_events<base_type> );
+  }
+
+  static std::shared_ptr<xag_storage> make_guarded_storage( allocation_callback const& callback )
+  {
+    if ( callback ) callback( { initial_allocated_bytes(), initial_allocated_bytes(), 1u } );
+    return std::make_shared<xag_storage>();
+  }
+
+  static size_t checked_add( size_t a, size_t b )
+  {
+    if ( b > std::numeric_limits<size_t>::max() - a ) throw std::length_error( "XAG allocation size overflow" );
+    return a + b;
+  }
+
+  template<class T>
+  static size_t next_capacity( std::vector<T> const& v )
+  {
+    if ( v.size() < v.capacity() ) return v.capacity();
+    if ( v.capacity() > v.max_size() / 2u ) throw std::length_error( "XAG vector capacity overflow" );
+    return std::max<size_t>( 1u, 2u * v.capacity() );
+  }
+
+  // Reserve in a declared sequence and compute its true old+new payload peak.
+  // The hash debug API uses the same slot/control-byte layout as its allocator.
+  void reserve_guarded( size_t nodes, size_t inputs, size_t outputs, size_t hash_elements, size_t size )
+  {
+    size_t resident = allocated_bytes();
+    size_t peak = resident;
+    const auto project = [&]( size_t old_bytes, size_t new_bytes ) {
+      if ( new_bytes <= old_bytes ) return;
+      peak = std::max( peak, checked_add( resident, new_bytes ) );
+      resident = checked_add( resident - old_bytes, new_bytes );
+    };
+    const auto vector_bytes = []( auto const& v, size_t capacity ) {
+      using value_type = typename std::decay_t<decltype( v )>::value_type;
+      if ( capacity > v.max_size() ) throw std::length_error( "XAG vector capacity overflow" );
+      return capacity * sizeof( value_type );
+    };
+    project( vector_bytes( _storage->nodes, _storage->nodes.capacity() ), vector_bytes( _storage->nodes, nodes ) );
+    project( vector_bytes( _storage->inputs, _storage->inputs.capacity() ), vector_bytes( _storage->inputs, inputs ) );
+    project( vector_bytes( _storage->outputs, _storage->outputs.capacity() ), vector_bytes( _storage->outputs, outputs ) );
+    if ( hash_elements > std::numeric_limits<size_t>::max() / ( 4u * sizeof( hash_type::value_type ) ) )
+      throw std::length_error( "XAG hash capacity overflow" );
+    const auto hash_bytes = hash_elements ? hash_debug::LowerBoundAllocatedByteSize( hash_elements ) : 0u;
+    project( hash_debug::AllocatedByteSize( _storage->hash ), hash_bytes );
+    _allocation_callback( { resident, peak, size } );
+    _storage->nodes.reserve( nodes );
+    _storage->inputs.reserve( inputs );
+    _storage->outputs.reserve( outputs );
+    if ( hash_bytes > hash_debug::AllocatedByteSize( _storage->hash ) ) _storage->hash.reserve( hash_elements );
+  }
+
 public:
   std::shared_ptr<xag_storage> _storage;
   std::shared_ptr<network_events<base_type>> _events;
+
+private:
+  allocation_callback _allocation_callback;
 };
 
 } // namespace mockturtle

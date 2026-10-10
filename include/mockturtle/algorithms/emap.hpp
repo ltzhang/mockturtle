@@ -907,6 +907,13 @@ public:
   using multi_single_matches_t = std::vector<multi_match_t>;
   using multi_matches_t = std::vector<std::vector<multi_match_t>>;
 
+  // Expose the actual fixed per-node tuple payload for external preallocation admission.
+  // Variable multi-output matches and optional stores are deliberately separate.
+  static constexpr std::size_t tuple_storage_bytes_per_node()
+  {
+    return sizeof( multioutput_info );
+  }
+
   using clock = typename std::chrono::steady_clock;
   using time_point = typename clock::time_point;
 

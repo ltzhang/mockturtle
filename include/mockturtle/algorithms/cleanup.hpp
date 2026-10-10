@@ -34,6 +34,8 @@
 
 #pragma once
 
+#include <functional>
+
 #include "../networks/crossed.hpp"
 #include "../traits.hpp"
 #include "../utils/node_map.hpp"
@@ -526,7 +528,8 @@ std::vector<signal<NtkDest>> cleanup_dangling( NtkSrc const& ntk, NtkDest& dest,
  * `remove_dangling_PIs` is true, dangling PIs are also omitted. If the flag
  * `remove_redundant_POs` is true, redundant POs, i.e. POs connected to a PI or
  * constant, are also omitted. The network types of the source and destination
- * network are the same.
+ * network are the same. The optional make_dest factory is invoked before
+ * allocating input maps and traversal storage, for caller-owned admission.
  *
    \verbatim embed:rst
 
@@ -552,7 +555,7 @@ std::vector<signal<NtkDest>> cleanup_dangling( NtkSrc const& ntk, NtkDest& dest,
  * - `is_constant`
  */
 template<class NtkSrc, class NtkDest = NtkSrc>
-[[nodiscard]] NtkDest cleanup_dangling( NtkSrc const& ntk, bool remove_dangling_PIs = false, bool remove_redundant_POs = false )
+[[nodiscard]] NtkDest cleanup_dangling( NtkSrc const& ntk, bool remove_dangling_PIs = false, bool remove_redundant_POs = false, std::function<NtkDest()> const& make_dest = {} )
 {
   static_assert( is_network_type_v<NtkSrc>, "NtkSrc is not a network type" );
   static_assert( is_network_type_v<NtkDest>, "NtkDest is not a network type" );
@@ -570,7 +573,7 @@ template<class NtkSrc, class NtkDest = NtkSrc>
   static_assert( has_create_not_v<NtkDest>, "NtkDest does not implement the create_not method" );
   static_assert( has_is_complemented_v<NtkSrc>, "NtkDest does not implement the is_complemented method" );
 
-  NtkDest dest;
+  NtkDest dest = make_dest ? make_dest() : NtkDest{};
 
   std::vector<signal<NtkDest>> cis;
   detail::clone_inputs( ntk, dest, cis, remove_dangling_PIs );
