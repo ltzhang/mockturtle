@@ -64,8 +64,8 @@ struct cut_enumeration_spectr_cut
   float cost{ 0.0f };
 };
 
-template<bool ComputeTruth>
-bool operator<( cut_type<ComputeTruth, cut_enumeration_spectr_cut> const& c1, cut_type<ComputeTruth, cut_enumeration_spectr_cut> const& c2 )
+template<int MaxLeaves, bool ComputeTruth>
+bool operator<( cut<MaxLeaves, cut_data<ComputeTruth, cut_enumeration_spectr_cut>> const& c1, cut<MaxLeaves, cut_data<ComputeTruth, cut_enumeration_spectr_cut>> const& c2 )
 {
   constexpr auto eps{ 0.005f };
 

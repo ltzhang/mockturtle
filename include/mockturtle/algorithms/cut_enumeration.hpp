@@ -91,6 +91,10 @@ struct cut_enumeration_stats
   /*! \brief Time for truth table computation. */
   stopwatch<>::duration time_truth_table{ 0 };
 
+  /*! \brief Bytes held by the committed cut storage after enumeration
+   * (zero for stores that do not report it). */
+  std::size_t storage_bytes{ 0 };
+
   /*! \brief Prints report. */
   void report() const
   {
@@ -164,11 +168,37 @@ struct network_cuts
 public:
   static constexpr uint32_t max_cut_num = 26;
   using cut_t = cut_type<ComputeTruth, CutData>;
-  using cut_set_t = cut_set<cut_t, max_cut_num>;
+  /* A node's committed cut set (runtime-sized, see `compact_cut_store`). */
+  using cut_set_t = cut_span<cut_t>;
+  /* The fixed-capacity working set one node's cuts are merged in. */
+  using working_set_t = cut_set<cut_t, max_cut_num>;
   static constexpr bool compute_truth = ComputeTruth;
 
+  /*! \brief Per-node upper bound of the committed cut storage under `cut_limit`
+   * (a node keeps at most `cut_limit` cuts: `cut_limit - 1` merged plus its unit cut). */
+  static constexpr std::size_t storage_bytes_per_node( uint32_t cut_limit )
+  {
+    return compact_cut_store<cut_t>::node_bound_bytes( clamp_cut_limit( cut_limit ) );
+  }
+
+  /*! \brief Per-store term of the bound (one partially used arena block, or
+   * none when a store of `nodes` nodes fits one exactly sized block). */
+  static constexpr std::size_t storage_slack_bytes( std::size_t nodes, uint32_t cut_limit )
+  {
+    return compact_cut_store<cut_t>::slack_bytes( nodes, clamp_cut_limit( cut_limit ) );
+  }
+
+  /*! \brief The cut count bound of `cut_limit` (0 means the working-set capacity). */
+  static constexpr uint32_t clamp_cut_limit( uint32_t cut_limit )
+  {
+    return cut_limit == 0u || cut_limit > max_cut_num ? max_cut_num : cut_limit;
+  }
+
+  /*! \brief Bytes the committed cut storage holds. */
+  std::size_t storage_bytes() const { return _cuts.allocated_bytes(); }
+
 private:
-  explicit network_cuts( uint32_t size ) : _cuts( size )
+  network_cuts( uint32_t size, uint32_t cut_limit ) : _cuts( size, clamp_cut_limit( cut_limit ) )
   {
     kitty::dynamic_truth_table zero( 0u ), proj( 1u );
     kitty::create_nth_var( proj, 0u );
@@ -251,9 +281,9 @@ private:
   friend network_cuts<_Ntk, _ComputeTruth, _CutData> cut_enumeration( _Ntk const& ntk, cut_enumeration_params const& ps, cut_enumeration_stats* pst );
 
 private:
-  void add_zero_cut( uint32_t index )
+  static void add_zero_cut( working_set_t& set, uint32_t index )
   {
-    auto& cut = _cuts[index].add_cut( &index, &index ); /* fake iterator for emptyness */
+    auto& cut = set.add_cut( &index, &index ); /* fake iterator for emptyness */
 
     if constexpr ( ComputeTruth )
     {
@@ -261,9 +291,9 @@ private:
     }
   }
 
-  void add_unit_cut( uint32_t index )
+  static void add_unit_cut( working_set_t& set, uint32_t index )
   {
-    auto& cut = _cuts[index].add_cut( &index, &index + 1 );
+    auto& cut = set.add_cut( &index, &index + 1 );
 
     if constexpr ( ComputeTruth )
     {
@@ -271,9 +301,14 @@ private:
     }
   }
 
+  void commit( uint32_t index, working_set_t const& set )
+  {
+    _cuts.commit( index, set );
+  }
+
 private:
-  /* compressed representation of cuts */
-  std::vector<cut_set_t> _cuts;
+  /* committed cut sets, sized to each node's surviving cuts */
+  compact_cut_store<cut_t> _cuts;
 
   /* cut truth tables */
   truth_table_cache<kitty::dynamic_truth_table> _truth_tables;
@@ -293,6 +328,7 @@ class cut_enumeration_impl
 public:
   using cut_t = typename network_cuts<Ntk, ComputeTruth, CutData>::cut_t;
   using cut_set_t = typename network_cuts<Ntk, ComputeTruth, CutData>::cut_set_t;
+  using working_set_t = typename network_cuts<Ntk, ComputeTruth, CutData>::working_set_t;
 
   explicit cut_enumeration_impl( Ntk const& ntk, cut_enumeration_params const& ps, cut_enumeration_stats& st, network_cuts<Ntk, ComputeTruth, CutData>& cuts )
       : ntk( ntk ),
@@ -316,13 +352,16 @@ public:
         std::cout << fmt::format( "[i] compute cut for node at index {}\n", index );
       }
 
+      /* Each node's cuts are merged in the fixed-capacity working set and
+       * then committed, sized to the cuts that survived. */
+      working.clear();
       if ( ntk.is_constant( node ) )
       {
-        cuts.add_zero_cut( index );
+        cuts.add_zero_cut( working, index );
       }
       else if ( ntk.is_ci( node ) )
       {
-        cuts.add_unit_cut( index );
+        cuts.add_unit_cut( working, index );
       }
       else
       {
@@ -335,6 +374,7 @@ public:
           merge_cuts( index );
         }
       }
+      cuts.commit( index, working );
     } );
   }
 
@@ -387,9 +427,7 @@ private:
       lcuts[i] = &cuts.cuts( ntk.node_to_index( ntk.get_node( child ) ) );
       pairs *= static_cast<uint32_t>( lcuts[i]->size() );
     } );
-    lcuts[2] = &cuts.cuts( index );
-    auto& rcuts = *lcuts[fanin];
-    rcuts.clear();
+    auto& rcuts = working;
 
     cut_t new_cut;
 
@@ -428,9 +466,11 @@ private:
 
     cuts._total_cuts += rcuts.size();
 
-    if ( rcuts.size() > 1 || ( *rcuts.begin() )->size() > 1 )
+    /* A node keeps at least one cut: the unit cut is added unless the only
+     * cut is already trivial. */
+    if ( rcuts.size() != 1 || ( *rcuts.begin() )->size() > 1 )
     {
-      cuts.add_unit_cut( index );
+      cuts.add_unit_cut( rcuts, index );
     }
   }
 
@@ -445,9 +485,8 @@ private:
     } );
 
     const auto fanin = cut_sizes.size();
-    lcuts[fanin] = &cuts.cuts( index );
 
-    auto& rcuts = *lcuts[fanin];
+    auto& rcuts = working;
 
     if ( fanin > 1 && fanin <= ps.fanin_limit )
     {
@@ -524,7 +563,7 @@ private:
 
     cuts._total_cuts += static_cast<uint32_t>( rcuts.size() );
 
-    cuts.add_unit_cut( index );
+    cuts.add_unit_cut( rcuts, index );
   }
 
 private:
@@ -533,7 +572,8 @@ private:
   cut_enumeration_stats& st;
   network_cuts<Ntk, ComputeTruth, CutData>& cuts;
 
-  std::array<cut_set_t*, Ntk::max_fanin_size + 1> lcuts;
+  std::array<cut_set_t const*, Ntk::max_fanin_size + 1> lcuts;
+  working_set_t working;
 };
 } /* namespace detail */
 /*! \endcond */
@@ -598,9 +638,10 @@ network_cuts<Ntk, ComputeTruth, CutData> cut_enumeration( Ntk const& ntk, cut_en
   static_assert( !ComputeTruth || has_compute_v<Ntk, kitty::dynamic_truth_table>, "Ntk does not implement the compute method for kitty::dynamic_truth_table" );
 
   cut_enumeration_stats st;
-  network_cuts<Ntk, ComputeTruth, CutData> res( ntk.size() );
+  network_cuts<Ntk, ComputeTruth, CutData> res( ntk.size(), ps.cut_limit );
   detail::cut_enumeration_impl<Ntk, ComputeTruth, CutData> p( ntk, ps, st, res );
   p.run();
+  st.storage_bytes = res.storage_bytes();
 
   if ( ps.verbose )
   {
@@ -646,12 +687,39 @@ struct fast_network_cuts
 {
 public:
   static constexpr uint32_t max_cut_num = 50;
-  using cut_t = cut_type<ComputeTruth, CutData>;
-  using cut_set_t = cut_set<cut_t, max_cut_num>;
+  /* Leaves are bounded by NumVars, so a cut stores exactly NumVars leaves. */
+  using cut_t = cut<NumVars, cut_data<ComputeTruth, CutData>>;
+  /* A node's committed cut set (runtime-sized, see `compact_cut_store`). */
+  using cut_set_t = cut_span<cut_t>;
+  /* The fixed-capacity working set one node's cuts are merged in. */
+  using working_set_t = cut_set<cut_t, max_cut_num>;
   static constexpr bool compute_truth = ComputeTruth;
 
+  /*! \brief Per-node upper bound of the committed cut storage under `cut_limit`
+   * (a node keeps at most `cut_limit` cuts: `cut_limit - 1` merged plus its unit cut). */
+  static constexpr std::size_t storage_bytes_per_node( uint32_t cut_limit )
+  {
+    return compact_cut_store<cut_t>::node_bound_bytes( clamp_cut_limit( cut_limit ) );
+  }
+
+  /*! \brief Per-store term of the bound (one partially used arena block, or
+   * none when a store of `nodes` nodes fits one exactly sized block). */
+  static constexpr std::size_t storage_slack_bytes( std::size_t nodes, uint32_t cut_limit )
+  {
+    return compact_cut_store<cut_t>::slack_bytes( nodes, clamp_cut_limit( cut_limit ) );
+  }
+
+  /*! \brief The cut count bound of `cut_limit` (0 means the working-set capacity). */
+  static constexpr uint32_t clamp_cut_limit( uint32_t cut_limit )
+  {
+    return cut_limit == 0u || cut_limit > max_cut_num ? max_cut_num : cut_limit;
+  }
+
+  /*! \brief Bytes the committed cut storage holds. */
+  std::size_t storage_bytes() const { return _cuts.allocated_bytes(); }
+
 private:
-  explicit fast_network_cuts( uint32_t size ) : _cuts( size )
+  fast_network_cuts( uint32_t size, uint32_t cut_limit ) : _cuts( size, clamp_cut_limit( cut_limit ) )
   {
     kitty::static_truth_table<NumVars> zero, proj;
     kitty::create_nth_var( proj, 0u );
@@ -734,9 +802,9 @@ private:
   friend fast_network_cuts<_Ntk, _NumVars, _ComputeTruth, _CutData> fast_cut_enumeration( _Ntk const& ntk, cut_enumeration_params const& ps, cut_enumeration_stats* pst );
 
 private:
-  void add_zero_cut( uint32_t index )
+  static void add_zero_cut( working_set_t& set, uint32_t index )
   {
-    auto& cut = _cuts[index].add_cut( &index, &index ); /* fake iterator for emptyness */
+    auto& cut = set.add_cut( &index, &index ); /* fake iterator for emptyness */
 
     if constexpr ( ComputeTruth )
     {
@@ -744,9 +812,9 @@ private:
     }
   }
 
-  void add_unit_cut( uint32_t index )
+  static void add_unit_cut( working_set_t& set, uint32_t index )
   {
-    auto& cut = _cuts[index].add_cut( &index, &index + 1 );
+    auto& cut = set.add_cut( &index, &index + 1 );
 
     if constexpr ( ComputeTruth )
     {
@@ -754,9 +822,14 @@ private:
     }
   }
 
+  void commit( uint32_t index, working_set_t const& set )
+  {
+    _cuts.commit( index, set );
+  }
+
 private:
-  /* compressed representation of cuts */
-  std::vector<cut_set_t> _cuts;
+  /* committed cut sets, sized to each node's surviving cuts */
+  compact_cut_store<cut_t> _cuts;
 
   /* cut truth tables */
   truth_table_cache<kitty::static_truth_table<NumVars>> _truth_tables;
@@ -776,6 +849,7 @@ class fast_cut_enumeration_impl
 public:
   using cut_t = typename fast_network_cuts<Ntk, NumVars, ComputeTruth, CutData>::cut_t;
   using cut_set_t = typename fast_network_cuts<Ntk, NumVars, ComputeTruth, CutData>::cut_set_t;
+  using working_set_t = typename fast_network_cuts<Ntk, NumVars, ComputeTruth, CutData>::working_set_t;
 
   explicit fast_cut_enumeration_impl( Ntk const& ntk, cut_enumeration_params const& ps, cut_enumeration_stats& st, fast_network_cuts<Ntk, NumVars, ComputeTruth, CutData>& cuts )
       : ntk( ntk ),
@@ -799,13 +873,16 @@ public:
         std::cout << fmt::format( "[i] compute cut for node at index {}\n", index );
       }
 
+      /* Each node's cuts are merged in the fixed-capacity working set and
+       * then committed, sized to the cuts that survived. */
+      working.clear();
       if ( ntk.is_constant( node ) )
       {
-        cuts.add_zero_cut( index );
+        cuts.add_zero_cut( working, index );
       }
       else if ( ntk.is_ci( node ) )
       {
-        cuts.add_unit_cut( index );
+        cuts.add_unit_cut( working, index );
       }
       else
       {
@@ -818,6 +895,7 @@ public:
           merge_cuts( index );
         }
       }
+      cuts.commit( index, working );
     } );
   }
 
@@ -868,9 +946,7 @@ private:
       lcuts[i] = &cuts.cuts( ntk.node_to_index( ntk.get_node( child ) ) );
       pairs *= static_cast<uint32_t>( lcuts[i]->size() );
     } );
-    lcuts[2] = &cuts.cuts( index );
-    auto& rcuts = *lcuts[fanin];
-    rcuts.clear();
+    auto& rcuts = working;
 
     cut_t new_cut;
 
@@ -909,9 +985,11 @@ private:
 
     cuts._total_cuts += rcuts.size();
 
-    if ( rcuts.size() > 1 || ( *rcuts.begin() )->size() > 1 )
+    /* A node keeps at least one cut: the unit cut is added unless the only
+     * cut is already trivial. */
+    if ( rcuts.size() != 1 || ( *rcuts.begin() )->size() > 1 )
     {
-      cuts.add_unit_cut( index );
+      cuts.add_unit_cut( rcuts, index );
     }
   }
 
@@ -926,9 +1004,8 @@ private:
     } );
 
     const auto fanin = cut_sizes.size();
-    lcuts[fanin] = &cuts.cuts( index );
 
-    auto& rcuts = *lcuts[fanin];
+    auto& rcuts = working;
 
     if ( fanin > 1 && fanin <= ps.fanin_limit )
     {
@@ -1005,7 +1082,7 @@ private:
 
     cuts._total_cuts += static_cast<uint32_t>( rcuts.size() );
 
-    cuts.add_unit_cut( index );
+    cuts.add_unit_cut( rcuts, index );
   }
 
 private:
@@ -1014,7 +1091,8 @@ private:
   cut_enumeration_stats& st;
   fast_network_cuts<Ntk, NumVars, ComputeTruth, CutData>& cuts;
 
-  std::array<cut_set_t*, Ntk::max_fanin_size + 1> lcuts;
+  std::array<cut_set_t const*, Ntk::max_fanin_size + 1> lcuts;
+  working_set_t working;
 };
 } /* namespace detail */
 /*! \endcond */
@@ -1085,9 +1163,10 @@ fast_network_cuts<Ntk, NumVars, ComputeTruth, CutData> fast_cut_enumeration( Ntk
   static_assert( !ComputeTruth || has_compute_v<Ntk, kitty::dynamic_truth_table>, "Ntk does not implement the compute method for kitty::dynamic_truth_table" );
 
   cut_enumeration_stats st;
-  fast_network_cuts<Ntk, NumVars, ComputeTruth, CutData> res( ntk.size() );
+  fast_network_cuts<Ntk, NumVars, ComputeTruth, CutData> res( ntk.size(), ps.cut_limit );
   detail::fast_cut_enumeration_impl<Ntk, NumVars, ComputeTruth, CutData> p( ntk, ps, st, res );
   p.run();
+  st.storage_bytes = res.storage_bytes();
 
   if ( ps.verbose )
   {
@@ -1130,7 +1209,8 @@ struct dynamic_network_cuts
 {
 public:
   static constexpr uint32_t max_cut_num = 16u;
-  using cut_t = cut_type<ComputeTruth, CutData>;
+  /* Leaves are bounded by NumVars, so a cut stores exactly NumVars leaves. */
+  using cut_t = cut<NumVars, cut_data<ComputeTruth, CutData>>;
   using cut_set_t = cut_set<cut_t, max_cut_num>;
   static constexpr bool compute_truth = ComputeTruth;
 

@@ -50,8 +50,8 @@ struct cut_enumeration_gia_cut
   uint32_t num_tree_leaves;
 };
 
-template<bool ComputeTruth>
-bool operator<( cut_type<ComputeTruth, cut_enumeration_gia_cut> const& c1, cut_type<ComputeTruth, cut_enumeration_gia_cut> const& c2 )
+template<int MaxLeaves, bool ComputeTruth>
+bool operator<( cut<MaxLeaves, cut_data<ComputeTruth, cut_enumeration_gia_cut>> const& c1, cut<MaxLeaves, cut_data<ComputeTruth, cut_enumeration_gia_cut>> const& c2 )
 {
   if ( c1->data.num_tree_leaves < c2->data.num_tree_leaves )
   {

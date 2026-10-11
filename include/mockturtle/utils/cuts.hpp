@@ -34,10 +34,16 @@
 
 #pragma once
 
+#include <algorithm>
 #include <array>
 #include <cassert>
+#include <cstddef>
 #include <iostream>
 #include <iterator>
+#include <memory>
+#include <new>
+#include <type_traits>
+#include <vector>
 
 #include <kitty/detail/mscfix.hpp>
 
@@ -98,7 +104,7 @@ public:
    */
   cut( cut const& other )
   {
-    _cend = _end = std::copy( other.begin(), other.end(), _leaves.begin() );
+    std::copy( other.begin(), other.end(), _leaves.begin() );
     _length = other._length;
     _signature = other._signature;
     _data = other._data;
@@ -146,13 +152,13 @@ public:
   auto begin() const { return _leaves.begin(); }
 
   /*! \brief End iterator (constant). */
-  auto end() const { return _cend; }
+  auto end() const { return _leaves.begin() + _length; }
 
   /*! \brief Begin iterator (mutable). */
   auto begin() { return _leaves.begin(); }
 
   /*! \brief End iterator (mutable). */
-  auto end() { return _end; }
+  auto end() { return _leaves.begin() + _length; }
 
   /*! \brief Access to data (mutable). */
   T* operator->() { return &_data; }
@@ -192,11 +198,13 @@ public:
   bool merge( cut const& that, cut& res, uint32_t cut_size ) const;
 
 private:
+  /* Compact layout: the end of the leaf range is derived from `_length` instead
+   * of being cached as two iterators (16 bytes per cut), and the 64-bit
+   * signature leads so the leaf array packs against the length without
+   * padding.  A cut store multiplies this size by every stored cut. */
+  uint64_t _signature{ 0 };
+  uint32_t _length{ 0 };
   std::array<uint32_t, MaxLeaves> _leaves;
-  uint32_t _length;
-  uint64_t _signature;
-  typename std::array<uint32_t, MaxLeaves>::const_iterator _cend;
-  typename std::array<uint32_t, MaxLeaves>::iterator _end;
 
   T _data;
 };
@@ -231,7 +239,7 @@ cut<MaxLeaves, T>& cut<MaxLeaves, T>::operator=( cut<MaxLeaves, T> const& other 
 {
   if ( &other != this )
   {
-    _cend = _end = std::copy( other.begin(), other.end(), _leaves.begin() );
+    std::copy( other.begin(), other.end(), _leaves.begin() );
     _length = other._length;
     _signature = other._signature;
     _data = other._data;
@@ -243,7 +251,7 @@ template<int MaxLeaves, typename T>
 template<typename Iterator>
 void cut<MaxLeaves, T>::set_leaves( Iterator begin, Iterator end )
 {
-  _cend = _end = std::copy( begin, end, _leaves.begin() );
+  std::copy( begin, end, _leaves.begin() );
   _length = static_cast<uint32_t>( std::distance( begin, end ) );
   _signature = 0;
 
@@ -264,8 +272,8 @@ template<int MaxLeaves, typename T>
 template<typename Iterator>
 void cut<MaxLeaves, T>::add_leaves( Iterator begin, Iterator end )
 {
-  _cend = _end = std::copy( begin, end, _end );
-  _length = static_cast<uint32_t>( std::distance( _leaves.begin(), _end ) );
+  const auto last = std::copy( begin, end, _leaves.begin() + _length );
+  _length = static_cast<uint32_t>( std::distance( _leaves.begin(), last ) );
 
   while ( begin != end )
   {
@@ -326,7 +334,6 @@ bool cut<MaxLeaves, T>::merge( cut const& that, cut& res, uint32_t cut_size ) co
   int32_t length = set_union_safe( begin(), end(), that.begin(), that.end(), res.begin(), cut_size );
   if ( length >= 0 )
   {
-    res._cend = res._end = res.begin() + length;
     res._length = static_cast<uint32_t>( length );
     res._signature = _signature | that._signature;
     return true;
@@ -587,5 +594,217 @@ void cut_set<CutType, MaxCuts>::limit( uint32_t size )
     _pcend = _pend = _pcuts.begin() + size;
   }
 }
+
+/*! \brief One node's committed cut set inside a `compact_cut_store`.
+ *
+ * A view over `size()` cut pointers that the store laid out contiguously,
+ * each pointing at a cut stored right before them in the same arena block.
+ * It reads exactly like a `cut_set` -- iteration yields `CutType*` lvalues,
+ * `operator[]` and `best()` yield cuts, and `update_best` reorders the
+ * pointers -- so cut consumers are agnostic of which store they read.
+ * The count is fixed at commit; `limit` may only shrink it.
+ */
+template<typename CutType>
+class cut_span
+{
+public:
+  CutType* const* begin() const { return _pcuts; }
+  CutType* const* end() const { return _pcuts + _size; }
+  CutType** begin() { return _pcuts; }
+  CutType** end() { return _pcuts + _size; }
+
+  std::ptrdiff_t size() const { return static_cast<std::ptrdiff_t>( _size ); }
+
+  CutType const& operator[]( uint32_t index ) const
+  {
+    assert( index < _size );
+    return *_pcuts[index];
+  }
+
+  CutType const& best() const { return *_pcuts[0]; }
+
+  /*! \brief Moves the cut at `index` to the front, keeping the others in order. */
+  void update_best( uint32_t index )
+  {
+    assert( index < _size );
+    auto* best = _pcuts[index];
+    for ( auto i = index; i > 0; --i )
+    {
+      _pcuts[i] = _pcuts[i - 1];
+    }
+    _pcuts[0] = best;
+  }
+
+  /*! \brief Keeps at most `size` cuts (the storage is not reclaimed). */
+  void limit( uint32_t size )
+  {
+    if ( _size > size )
+    {
+      _size = size;
+    }
+  }
+
+  friend std::ostream& operator<<( std::ostream& os, cut_span const& set )
+  {
+    for ( auto const& c : set )
+    {
+      os << *c << "\n";
+    }
+    return os;
+  }
+
+private:
+  template<typename>
+  friend class compact_cut_store;
+
+  CutType** _pcuts{ nullptr };
+  uint32_t _size{ 0 };
+};
+
+/*! \brief Runtime-sized cut database for an enumeration that commits each
+ * node's cut set once, in topological order.
+ *
+ * Enumeration merges a node's cuts in a fixed-capacity working `cut_set`
+ * and then `commit`s the surviving cuts here: each node costs exactly its
+ * own cuts plus one pointer per cut and one `cut_span`, instead of the
+ * working set's full compile-time capacity.  Cuts live in append-only
+ * arena blocks, so committed cuts never move and a committed span stays
+ * valid for the store's lifetime (the store is move-only).  The bound
+ * `max_bytes` lets a caller admit the store before enumerating.
+ */
+template<typename CutType>
+class compact_cut_store
+{
+public:
+  static constexpr std::size_t block_bytes = std::size_t{ 1 } << 20;
+
+  /*! \brief A store for `nodes` nodes of at most `max_cuts` cuts each.
+   *
+   * A store whose worst case fits in one block allocates a single block of
+   * exactly that size, so a small network never pays for a full block. */
+  compact_cut_store( std::size_t nodes, std::size_t max_cuts )
+      : _spans( nodes ),
+        _block_size( fits_one_block( nodes, max_cuts ) ? std::max<std::size_t>( nodes * record_bytes( max_cuts ), 1u ) : block_bytes )
+  {
+  }
+
+  compact_cut_store( compact_cut_store&& ) noexcept = default;
+  compact_cut_store& operator=( compact_cut_store&& ) noexcept = default;
+  compact_cut_store( compact_cut_store const& ) = delete;
+  compact_cut_store& operator=( compact_cut_store const& ) = delete;
+
+  cut_span<CutType>& operator[]( std::size_t index ) { return _spans[index]; }
+  cut_span<CutType> const& operator[]( std::size_t index ) const { return _spans[index]; }
+
+  std::size_t size() const { return _spans.size(); }
+
+  /*! \brief Copies the cuts of `set` (in its order) as node `index`'s cut set.
+   *
+   * `set` is any range yielding `CutType*`, typically the working `cut_set`.
+   * A node is committed at most once.
+   */
+  template<typename Set>
+  void commit( std::size_t index, Set const& set )
+  {
+    auto& span = _spans[index];
+    assert( span._size == 0 && "a node's cuts are committed once" );
+    const auto count = static_cast<std::size_t>( std::distance( set.begin(), set.end() ) );
+    if ( count == 0 )
+    {
+      return;
+    }
+    std::byte* raw = allocate( count * ( sizeof( CutType ) + sizeof( CutType* ) ) );
+    auto* cuts = reinterpret_cast<CutType*>( raw );
+    auto** pcuts = reinterpret_cast<CutType**>( raw + count * sizeof( CutType ) );
+    std::size_t i = 0;
+    for ( auto const* c : set )
+    {
+      ::new ( static_cast<void*>( cuts + i ) ) CutType( *c );
+      pcuts[i] = cuts + i;
+      ++i;
+    }
+    span._pcuts = pcuts;
+    span._size = static_cast<uint32_t>( count );
+  }
+
+  /*! \brief Bytes this store currently holds: arena blocks plus span records. */
+  std::size_t allocated_bytes() const
+  {
+    return _block_total + _spans.capacity() * sizeof( cut_span<CutType> );
+  }
+
+  /*! \brief Bytes one committed node of `cuts` cuts occupies in the arena. */
+  static constexpr std::size_t record_bytes( std::size_t cuts )
+  {
+    return cuts * ( sizeof( CutType ) + sizeof( CutType* ) );
+  }
+
+  /*! \brief Per-node share of the upper bound for nodes of at most `max_cuts` cuts.
+   *
+   * A node's record never straddles blocks, so a block is abandoned with less
+   * than one maximal record `r` unused: every block of `B` bytes holds at least
+   * `B - r` used bytes.  Charging each node `r * B / (B - r)` (rounded up) plus
+   * its span therefore bounds every block but the last; `slack_bytes` covers
+   * that one.  A record larger than half a block is charged a whole block. */
+  static constexpr std::size_t node_bound_bytes( std::size_t max_cuts )
+  {
+    const std::size_t r = record_bytes( max_cuts );
+    const std::size_t share = 2 * r > block_bytes ? r + block_bytes : r + ( r * r + ( block_bytes - r ) - 1 ) / ( block_bytes - r );
+    return share + sizeof( cut_span<CutType> );
+  }
+
+  /*! \brief True when the worst case of `nodes` nodes fits one block. */
+  static constexpr bool fits_one_block( std::size_t nodes, std::size_t max_cuts )
+  {
+    const std::size_t r = record_bytes( max_cuts );
+    return r == 0 || nodes <= block_bytes / r;
+  }
+
+  /*! \brief The bound's per-store term: the last, partially used block, or
+   * nothing when the whole store is one exactly sized block. */
+  static constexpr std::size_t slack_bytes( std::size_t nodes, std::size_t max_cuts )
+  {
+    return fits_one_block( nodes, max_cuts ) ? 0u : block_bytes;
+  }
+
+  /*! \brief Upper bound on `allocated_bytes()` for `nodes` nodes of at most
+   * `max_cuts` cuts each (unchecked arithmetic; callers that admit untrusted
+   * sizes multiply `node_bound_bytes` themselves with overflow checks). */
+  static constexpr std::size_t max_bytes( std::size_t nodes, std::size_t max_cuts )
+  {
+    return nodes * node_bound_bytes( max_cuts ) + slack_bytes( nodes, max_cuts );
+  }
+
+private:
+  /* blocks are released as raw bytes: committed cuts are never destroyed */
+  static_assert( std::is_trivially_destructible_v<CutType>, "compact_cut_store holds trivially destructible cuts" );
+  static_assert( alignof( CutType ) <= alignof( std::max_align_t ), "over-aligned cut type" );
+  static_assert( sizeof( CutType ) % alignof( CutType* ) == 0, "cut pointers must stay aligned after the cuts" );
+
+  std::byte* allocate( std::size_t bytes )
+  {
+    constexpr std::size_t align = alignof( CutType ) > alignof( CutType* ) ? alignof( CutType ) : alignof( CutType* );
+    bytes = ( bytes + align - 1 ) / align * align;
+    if ( bytes > _left )
+    {
+      const std::size_t size = bytes > _block_size ? bytes : _block_size;
+      _blocks.emplace_back( new std::byte[size] );
+      _block_total += size;
+      _cursor = _blocks.back().get();
+      _left = size;
+    }
+    std::byte* out = _cursor;
+    _cursor += bytes;
+    _left -= bytes;
+    return out;
+  }
+
+  std::vector<cut_span<CutType>> _spans;
+  std::size_t _block_size;
+  std::vector<std::unique_ptr<std::byte[]>> _blocks;
+  std::byte* _cursor{ nullptr };
+  std::size_t _left{ 0 };
+  std::size_t _block_total{ 0 };
+};
 
 } /* namespace mockturtle */

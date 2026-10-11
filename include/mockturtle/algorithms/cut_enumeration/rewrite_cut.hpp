@@ -49,8 +49,8 @@ struct cut_enumeration_rewrite_cut
   uint32_t cost;
 };
 
-template<bool ComputeTruth>
-bool operator<( cut_type<ComputeTruth, cut_enumeration_rewrite_cut> const& c1, cut_type<ComputeTruth, cut_enumeration_rewrite_cut> const& c2 )
+template<int MaxLeaves, bool ComputeTruth>
+bool operator<( cut<MaxLeaves, cut_data<ComputeTruth, cut_enumeration_rewrite_cut>> const& c1, cut<MaxLeaves, cut_data<ComputeTruth, cut_enumeration_rewrite_cut>> const& c2 )
 {
   if ( c1->data.cost < c2->data.cost )
     return true;
