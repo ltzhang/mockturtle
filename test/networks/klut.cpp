@@ -59,6 +59,35 @@ TEST_CASE( "create and use primary inputs in a k-LUT network", "[klut]" )
   CHECK( x1 != x2 );
 }
 
+TEST_CASE( "combinational-input queries of a k-LUT network are O(1) and exact", "[klut]" )
+{
+  klut_network klut;
+  auto const a = klut.create_pi();
+  auto const b = klut.create_pi();
+  kitty::dynamic_truth_table identity( 1 );
+  kitty::create_nth_var( identity, 0 );
+  auto const buf = klut.create_node( { a }, identity ); /* a PI's function literal, but a gate */
+  auto const g = klut.create_and( a, b );
+  auto const c = klut.create_pi(); /* a CI created after gates */
+
+  CHECK( klut.is_ci( a ) );
+  CHECK( klut.is_pi( b ) );
+  CHECK( klut.is_ci( c ) );
+  CHECK( !klut.is_ci( klut.get_node( buf ) ) );
+  CHECK( !klut.is_ci( g ) );
+  CHECK( !klut.is_ci( klut.get_node( klut.get_constant( false ) ) ) );
+  CHECK( !klut.is_ci( klut.size() + 10 ) ); /* past the end of the network */
+  CHECK( klut.ci_position( a ) == 0u );
+  CHECK( klut.ci_position( c ) == 2u );
+  CHECK( klut.ci_position( g ) == klut_storage_data::no_ci );
+  CHECK( klut.fanin_size( g ) == 2u );
+  CHECK( klut.fanin_size( c ) == 0u );
+
+  auto const copy = klut.clone();
+  CHECK( copy.is_ci( c ) );
+  CHECK( !copy.is_ci( g ) );
+}
+
 TEST_CASE( "create and use primary outputs in a k-LUT network", "[klut]" )
 {
   klut_network klut;

@@ -57,6 +57,18 @@ namespace mockturtle
 struct klut_storage_data
 {
   truth_table_cache<kitty::dynamic_truth_table> cache;
+
+  /* Position of each combinational input in `inputs`, indexed by node; a node past the end, or
+   * holding `no_ci`, is not a CI. Makes `is_ci`/`is_pi` O(1) instead of a search of `inputs`
+   * (quadratic over a traversal of a large network). CIs are created first in practice, so this
+   * stays the size of the input list. */
+  static constexpr uint32_t no_ci = ~uint32_t( 0 );
+  std::vector<uint32_t> ci_position;
+
+  uint32_t ci_position_of( uint64_t n ) const
+  {
+    return n < ci_position.size() ? ci_position[n] : no_ci;
+  }
 };
 
 /*! \brief k-LUT node
@@ -187,6 +199,12 @@ public:
   {
     const auto index = _storage->nodes.size();
     _storage->nodes.emplace_back();
+    auto& position = _storage->data.ci_position;
+    if ( position.size() <= index )
+    {
+      position.resize( index + 1, klut_storage_data::no_ci );
+    }
+    position[index] = static_cast<uint32_t>( _storage->inputs.size() );
     _storage->inputs.emplace_back( index );
     _storage->nodes[index].data[1].h1 = 2;
     return index;
@@ -213,12 +231,18 @@ public:
 
   bool is_ci( node const& n ) const
   {
-    return std::find( _storage->inputs.begin(), _storage->inputs.end(), n ) != _storage->inputs.end();
+    return _storage->data.ci_position_of( n ) != klut_storage_data::no_ci;
   }
 
   bool is_pi( node const& n ) const
   {
-    return std::find( _storage->inputs.begin(), _storage->inputs.end(), n ) != _storage->inputs.end();
+    return is_ci( n );
+  }
+
+  /*! \brief Position of CI `n` in creation order, or `klut_storage_data::no_ci`. O(1). */
+  uint32_t ci_position( node const& n ) const
+  {
+    return _storage->data.ci_position_of( n );
   }
 
   bool constant_value( node const& n ) const

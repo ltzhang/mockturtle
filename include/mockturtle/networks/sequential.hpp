@@ -690,18 +690,40 @@ public:
 
   bool is_ci( node const& n ) const
   {
-    return std::find( this->_storage->inputs.begin(), this->_storage->inputs.end(), n ) != this->_storage->inputs.end();
+    if constexpr ( std::is_same_v<typename Ntk::base_type, klut_network> )
+    {
+      return Ntk::is_ci( n );
+    }
+    else
+    {
+      return std::find( this->_storage->inputs.begin(), this->_storage->inputs.end(), n ) != this->_storage->inputs.end();
+    }
   }
 
   bool is_pi( node const& n ) const
   {
-    const auto end = this->_storage->inputs.begin() + _sequential_storage->num_pis;
-    return std::find( this->_storage->inputs.begin(), end, n ) != end;
+    if constexpr ( std::is_same_v<typename Ntk::base_type, klut_network> )
+    {
+      return Ntk::ci_position( n ) < _sequential_storage->num_pis;
+    }
+    else
+    {
+      const auto end = this->_storage->inputs.begin() + _sequential_storage->num_pis;
+      return std::find( this->_storage->inputs.begin(), end, n ) != end;
+    }
   }
 
   bool is_ro( node const& n ) const
   {
-    return std::find( this->_storage->inputs.begin() + _sequential_storage->num_pis, this->_storage->inputs.end(), n ) != this->_storage->inputs.end();
+    if constexpr ( std::is_same_v<typename Ntk::base_type, klut_network> )
+    {
+      const auto position = Ntk::ci_position( n );
+      return position != klut_storage_data::no_ci && position >= _sequential_storage->num_pis;
+    }
+    else
+    {
+      return std::find( this->_storage->inputs.begin() + _sequential_storage->num_pis, this->_storage->inputs.end(), n ) != this->_storage->inputs.end();
+    }
   }
 
   auto num_cis() const
