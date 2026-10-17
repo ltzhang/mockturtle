@@ -99,6 +99,18 @@ struct map_params
   /*! \brief Number of rounds for exact switching power optimization. */
   uint32_t eswp_rounds{ 0u };
 
+  /*! \brief Work budget for exact area/switching recovery (0 = unbounded).
+   *
+   * Counts recursive cut reference/dereference visits across every exact
+   * round. The exact phase evaluates each candidate cut by referencing and
+   * dereferencing its cone, which is quadratic on large networks whose
+   * cones are mostly outside the cover. When the budget is exceeded the
+   * current round stops at a node boundary (reference counts stay
+   * consistent), the remaining exact rounds are skipped, and the cover found
+   * so far is returned; `map_stats::exact_budget_exhausted` reports it.
+   */
+  uint64_t exact_work_limit{ 0u };
+
   /*! \brief Number of patterns for switching activity computation. */
   uint32_t switching_activity_patterns{ 2048u };
 
@@ -145,6 +157,12 @@ struct map_stats
 
   /*! \brief Mapping error. */
   bool mapping_error{ false };
+
+  /*! \brief Cut reference/dereference visits spent in exact rounds. */
+  uint64_t exact_work{ 0 };
+
+  /*! \brief The exact rounds stopped early on `map_params::exact_work_limit`. */
+  bool exact_budget_exhausted{ false };
 
   void report() const
   {
@@ -326,7 +344,7 @@ private:
     }
 
     /* compute mapping using exact area */
-    while ( iteration < ps.ela_rounds + ps.area_flow_rounds + 1 )
+    while ( iteration < ps.ela_rounds + ps.area_flow_rounds + 1 && !st.exact_budget_exhausted )
     {
       compute_required_time();
       if ( !compute_mapping_exact<false>() )
@@ -336,7 +354,7 @@ private:
     }
 
     /* compute mapping using exact switching activity estimation */
-    while ( iteration < ps.eswp_rounds + ps.ela_rounds + ps.area_flow_rounds + 1 )
+    while ( iteration < ps.eswp_rounds + ps.ela_rounds + ps.area_flow_rounds + 1 && !st.exact_budget_exhausted )
     {
       compute_required_time();
       if ( !compute_mapping_exact<true>() )
@@ -497,6 +515,14 @@ private:
     {
       if ( ntk.is_constant( n ) || ntk.is_ci( n ) )
         continue;
+
+      /* stop at a node boundary once the exact-recovery budget is spent: every
+       * node processed so far re-referenced its choice, so the cover is consistent */
+      if ( ps.exact_work_limit != 0u && st.exact_work > ps.exact_work_limit )
+      {
+        st.exact_budget_exhausted = true;
+        break;
+      }
 
       auto index = ntk.node_to_index( n );
       auto& node_data = node_match[index];
@@ -1215,6 +1241,8 @@ private:
     auto const& node_data = node_match[ntk.node_to_index( n )];
     float count;
 
+    ++st.exact_work;
+
     if constexpr ( SwitchActivity )
       count = switch_activity[ntk.node_to_index( n )];
     else
@@ -1283,6 +1311,8 @@ private:
   {
     auto const& node_data = node_match[ntk.node_to_index( n )];
     float count;
+
+    ++st.exact_work;
 
     if constexpr ( SwitchActivity )
       count = switch_activity[ntk.node_to_index( n )];
