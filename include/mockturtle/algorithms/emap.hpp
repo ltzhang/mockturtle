@@ -150,6 +150,14 @@ struct emap_params
   /*! \brief Wire capacitance charged per fanout edge in the electrical load estimate. */
   double wire_cap_per_fanout{ 0.0 };
 
+  /*! \brief Capacitance each primary output drives OUTSIDE the network, in the library's
+   * capacitance units, one entry per PO in PO order (electrical model only). A network that is
+   * one region of a larger netlist has boundary outputs feeding sinks the cover never sees; without
+   * this their pins load the boundary driver by nothing, and a 25 fF boundary net is covered with
+   * a drive-0 cell. Added to the PO's driver in the round-0 seed and in every load refresh. Empty
+   * (default) = no external load, byte-identical; a size other than the PO count is ignored. */
+  std::vector<double> po_loads;
+
   /*! Optional total wire capacitance C(F), in the library's capacitance units.
    * Driver excluded, output terminals included. Replaces the scalar when set.
    * Total must be finite/nonnegative; a table need not be monotone. */
@@ -2306,6 +2314,20 @@ private:
       if ( ps.wire_cap_for_fanout )
         node_fanouts[index][0] = node_fanouts[index][1] = count;
     } );
+    charge_po_loads();
+  }
+
+  /* External boundary load (`po_loads`): each PO's driver, in the PO's phase, carries the sinks
+   * the network does not contain. */
+  void charge_po_loads()
+  {
+    if ( ps.po_loads.empty() || ps.po_loads.size() != ntk.num_pos() )
+      return;
+    ntk.foreach_po( [&]( auto const& signal, auto i ) {
+      uint32_t const index = ntk.node_to_index( ntk.get_node( signal ) );
+      uint8_t const phase = ntk.is_complemented( signal ) ? 1u : 0u;
+      node_loads[index][phase] += static_cast<float>( ps.po_loads[i] );
+    } );
   }
 
   /* Recompute each signal's load from the cover's committed choices. The traversal mirrors
@@ -2403,6 +2425,7 @@ private:
         for ( uint8_t phase = 0; phase < 2; ++phase )
           node_loads[index][phase] += static_cast<float>( wire_cap_at( node_fanouts[index][phase] ) );
     }
+    charge_po_loads();
 
     select_output_buffers();
   }
