@@ -2279,10 +2279,13 @@ private:
           double const in = node_match[index].arrival[phase ^ 1];
           for ( uint32_t k = 0; k < ladder.size; ++k )
           {
-            float const l = ladder.points[k];
-            curve[k] = in + ( ps.inverter_delay_drive
-                                  ? library.inverter_delay( library.select_inverter_for_delay( l ), l )
-                                  : lib_inv_delay + lib_inv_slope * l );
+            if ( ps.inverter_delay_drive )
+            {
+              float const l = ladder.points[k];
+              curve[k] = in + library.inverter_delay( library.select_inverter_for_delay( l ), l );
+            }
+            else
+              curve[k] = in + lib_inv_delay + lib_inv_slope * ladder.points[k]; /* exact pre-option order */
           }
         }
         else
