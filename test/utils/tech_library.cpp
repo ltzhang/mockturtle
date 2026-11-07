@@ -1329,6 +1329,30 @@ TEST_CASE( "select_inverter sizes a materialized polarity inverter by its load",
   CHECK( lib.select_inverter( 1e6f ) == strong );
 }
 
+TEST_CASE( "select_inverter_for_delay sizes a polarity inverter at electrical effort 4", "[tech_library]" )
+{
+  /* emap's inverter_delay_drive: the smallest legal drive whose load / input capacitance is at
+   * most the effort, else the strongest legal drive, else select_inverter's best illegal one. */
+  std::vector<gate> gates;
+  std::istringstream in( drive_family_library ); /* inv_w cap 0.5 limit 2.0, inv_s cap 2.0 limit 20.0 */
+  CHECK( lorina::read_genlib( in, genlib_reader( gates ) ) == lorina::return_code::success );
+  tech_library_params ps;
+  ps.electrical_model = true;
+  tech_library<2> lib( gates, ps );
+  uint32_t const weak = lib.select_inverter( 0.0f );
+  uint32_t const strong = lib.select_inverter( 8.0f );
+  REQUIRE( weak != strong );
+  CHECK( lib.select_inverter_for_delay( 1.0f ) == weak );   /* effort 2 on the weak drive */
+  CHECK( lib.select_inverter_for_delay( 1.9f ) == weak );   /* effort 3.8: still the weak one */
+  CHECK( lib.select_inverter_for_delay( 1.5f, 2.0f ) == strong ); /* a lower effort target upsizes */
+  CHECK( lib.select_inverter_for_delay( 3.0f ) == strong ); /* past the weak drive's limit */
+  CHECK( lib.select_inverter_for_delay( 15.0f ) == strong ); /* effort 7.5: the strongest legal */
+  CHECK( lib.select_inverter_for_delay( 1e6f ) == strong ); /* nothing legal: best illegal */
+  /* inverter_delay prices the selected drive: block + slope x load */
+  CHECK( lib.inverter_delay( weak, 1.0f ) == Approx( 0.010f + 0.100f * 1.0f ) );
+  CHECK( lib.inverter_delay( strong, 10.0f ) == Approx( 0.020f + 0.010f * 10.0f ) );
+}
+
 TEST_CASE( "select_buffer records a drive family and sizes by load", "[tech_library]" )
 {
   /* The optional output-buffer covering stage chooses a buffer against the signal's real load,

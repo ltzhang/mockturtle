@@ -158,6 +158,13 @@ struct emap_params
    * (default) = no external load, byte-identical; a size other than the PO count is ignored. */
   std::vector<double> po_loads;
 
+  /*! \brief Size each materialized polarity inverter for delay (electrical model only): its
+   * binding, its priced delay and the input capacitance it charges on the signal it reads all
+   * come from tech_library::select_inverter_for_delay at the inverted signal's load (the smallest
+   * legal drive at electrical effort <= 4, logical effort's delay-optimal stage), instead of the
+   * smallest legal drive priced as the smallest inverter. Off (default) = byte-identical. */
+  bool inverter_delay_drive{ false };
+
   /*! Optional total wire capacitance C(F), in the library's capacitance units.
    * Driver excluded, output terminals included. Replaces the scalar when set.
    * Total must be finite/nonnegative; a table need not be monotone. */
@@ -971,6 +978,8 @@ public:
   {
     if ( ps.wire_cap_for_fanout && ( !ps.electrical_model || ps.map_multioutput || ps.cover_buffer ) )
       throw std::invalid_argument( "wire capacitance callback requires electrical single-output mapping without cover-buffer" );
+    if ( ps.inverter_delay_drive && ( !ps.electrical_model || ps.map_multioutput ) )
+      throw std::invalid_argument( "inverter_delay_drive requires electrical single-output mapping (the block-network cover binds the smallest inverter)" );
     std::memset( node_tuple_match.data(), 0, sizeof( multioutput_info ) * ntk.size() );
     std::tie( lib_inv_area, lib_inv_delay, lib_inv_id ) = library.get_inverter_info();
     std::tie( lib_buf_area, lib_buf_delay, lib_buf_id ) = library.get_buffer_info();
@@ -997,6 +1006,8 @@ public:
   {
     if ( ps.wire_cap_for_fanout && ( !ps.electrical_model || ps.map_multioutput || ps.cover_buffer ) )
       throw std::invalid_argument( "wire capacitance callback requires electrical single-output mapping without cover-buffer" );
+    if ( ps.inverter_delay_drive && ( !ps.electrical_model || ps.map_multioutput ) )
+      throw std::invalid_argument( "inverter_delay_drive requires electrical single-output mapping (the block-network cover binds the smallest inverter)" );
     std::memset( node_tuple_match.data(), 0, sizeof( multioutput_info ) * ntk.size() );
     std::tie( lib_inv_area, lib_inv_delay, lib_inv_id ) = library.get_inverter_info();
     std::tie( lib_buf_area, lib_buf_delay, lib_buf_id ) = library.get_buffer_info();
@@ -2044,6 +2055,11 @@ private:
   {
     if ( !ps.electrical_model )
       return lib_inv_delay;
+    if ( ps.inverter_delay_drive )
+    {
+      float const load = node_loads[index][inv_phase];
+      return library.inverter_delay( library.select_inverter_for_delay( load ), load );
+    }
     return lib_inv_delay + lib_inv_slope * node_loads[index][inv_phase];
   }
 
@@ -2083,6 +2099,8 @@ private:
   {
     if ( !ps.electrical_model )
       return lib_inv_id;
+    if ( ps.inverter_delay_drive )
+      return library.select_inverter_for_delay( node_loads[index][inv_phase] );
     return library.select_inverter( node_loads[index][inv_phase] );
   }
 
@@ -2260,7 +2278,12 @@ private:
            * curve here would bill the same pin twice. */
           double const in = node_match[index].arrival[phase ^ 1];
           for ( uint32_t k = 0; k < ladder.size; ++k )
-            curve[k] = in + lib_inv_delay + lib_inv_slope * ladder.points[k];
+          {
+            float const l = ladder.points[k];
+            curve[k] = in + ( ps.inverter_delay_drive
+                                  ? library.inverter_delay( library.select_inverter_for_delay( l ), l )
+                                  : lib_inv_delay + lib_inv_slope * l );
+          }
         }
         else
         {
@@ -2348,6 +2371,7 @@ private:
     if ( ps.wire_cap_for_fanout )
       for ( auto& count : node_fanouts )
         count[0] = count[1] = 0u;
+    inverter_reads.clear();
 
     auto charge_cut = [&]( uint32_t index, uint8_t phase ) {
       auto const& node_data = node_match[index];
@@ -2378,6 +2402,8 @@ private:
         if ( node_data.map_refs[1] > 0 )
         {
           node_loads[index][0] += lib_inv_cap + wire; /* negated PI: an inverter reads the PI */
+          if ( ps.inverter_delay_drive )
+            inverter_reads.push_back( { index, 0u } );
           if ( ps.wire_cap_for_fanout )
             ++node_fanouts[index][0];
         }
@@ -2403,6 +2429,8 @@ private:
         if ( node_data.same_match && node_data.map_refs[use_phase ^ 1] > 0 )
         {
           node_loads[index][use_phase] += lib_inv_cap + wire;
+          if ( ps.inverter_delay_drive )
+            inverter_reads.push_back( { index, use_phase } );
           if ( ps.wire_cap_for_fanout )
             ++node_fanouts[index][use_phase];
         }
@@ -2426,8 +2454,22 @@ private:
           node_loads[index][phase] += static_cast<float>( wire_cap_at( node_fanouts[index][phase] ) );
     }
     charge_po_loads();
+    recharge_delay_inverters();
 
     select_output_buffers();
+  }
+
+  /* inverter_delay_drive: each materialized inverter was charged at the smallest inverter's input
+   * capacitance during the walk, because the drive it gets depends on the load of the signal it
+   * produces, complete only now. Swap in the selected drive's capacitance. */
+  void recharge_delay_inverters()
+  {
+    for ( auto const& [index, read_phase] : inverter_reads )
+    {
+      float const out_load = node_loads[index][read_phase ^ 1u];
+      float const cap = library.inverter_input_load( library.select_inverter_for_delay( out_load ) );
+      node_loads[index][read_phase] += cap - lib_inv_cap;
+    }
   }
 
   /* Optional single-input covering stage (cover_buffer): once the raw sink sums are known, every
@@ -7742,6 +7784,9 @@ private:
    * loads are seeded from fanout counts (init_node_loads) and refreshed from the committed
    * cover after every round (update_node_loads). All zero unless ps.electrical_model. */
   float lib_inv_cap{ 0 };
+  /* inverter_delay_drive: (node, phase the inverter reads) of every materialized inverter charged in
+   * the current load refresh */
+  std::vector<std::pair<uint32_t, uint8_t>> inverter_reads;
   float lib_inv_slope{ 0 };
   std::vector<std::array<float, 2>> node_loads;
   // Only allocated for the optional nonlinear model; tracks real sink pins and POs.

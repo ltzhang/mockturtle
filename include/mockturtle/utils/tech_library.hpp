@@ -395,6 +395,39 @@ public:
     return 0.0f;
   }
 
+  /*! \brief The inverter drive sized for delay at @p load: the smallest legal drive whose
+   * electrical effort (load / input capacitance) is at most @p effort -- about 4 is the
+   * delay-optimal stage effort of logical effort, which weighs the drive's own delay against the
+   * load its input puts on the gate before it. When no legal drive is that strong, the legal drive
+   * with the largest input capacitance (the strongest); with no legal drive at all,
+   * select_inverter's best illegal choice. Without an inverter family, the smallest inverter. */
+  uint32_t select_inverter_for_delay( float load, float effort = 4.0f ) const
+  {
+    if ( _inverters.empty() )
+      return _inv_id;
+    inverter_drive const* strongest = nullptr;
+    for ( auto const& inv : _inverters ) /* area-ascending */
+    {
+      if ( inv.max_load > 0.0f && load > inv.max_load + epsilon )
+        continue;
+      if ( inv.cap > 0.0f && load <= effort * inv.cap + epsilon )
+        return inv.id;
+      if ( strongest == nullptr || inv.cap > strongest->cap )
+        strongest = &inv;
+    }
+    return strongest != nullptr ? strongest->id : select_inverter( load );
+  }
+
+  /*! \brief block + slope x @p load of inverter drive @p id; the smallest inverter's terms for an
+   * id outside the family. */
+  float inverter_delay( uint32_t id, float load ) const
+  {
+    for ( auto const& inv : _inverters )
+      if ( inv.id == id )
+        return inv.block + inv.slope * load;
+    return _inv_delay + _inv_slope * load;
+  }
+
   uint32_t select_inverter( float load ) const
   {
     if ( _inverters.empty() )
@@ -545,7 +578,9 @@ private:
           {
             _inverters.push_back( inverter_drive{ gate.id, static_cast<float>( gate.area ),
                                                   static_cast<float>( gate.pins[0].max_load ),
-                                                  static_cast<float>( gate.pins[0].input_load ) } );
+                                                  static_cast<float>( gate.pins[0].input_load ),
+                                                  static_cast<float>( compute_worst_delay( gate ) ),
+                                                  static_cast<float>( std::max( gate.pins[0].rise_fanout_delay, gate.pins[0].fall_fanout_delay ) ) } );
           }
         }
         else
@@ -1542,6 +1577,8 @@ private:
     float area;
     float max_load; /* 0 = undeclared/unconstrained */
     float cap;      /* input capacitance this drive presents to whatever feeds it */
+    float block{ 0.0f }; /* load-independent delay term */
+    float slope{ 0.0f }; /* delay per unit output load */
   };
   std::vector<inverter_drive> _inverters; /* area-ascending; empty without the electrical model */
 

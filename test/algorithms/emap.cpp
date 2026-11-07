@@ -1162,6 +1162,37 @@ TEST_CASE( "emap load-aware mapping reports drive legality", "[emap]" )
   }
 }
 
+TEST_CASE( "emap inverter_delay_drive is off by default and refuses an unsupported cover", "[emap]" )
+{
+  emap_params defaults;
+  CHECK( defaults.inverter_delay_drive == false );
+
+  std::vector<gate> gates;
+  std::istringstream in( drive_family_library );
+  lorina::read_genlib( in, genlib_reader( gates ) );
+  tech_library_params tps;
+  tps.electrical_model = true;
+  tech_library<3> tlib( gates, tps );
+  aig_network aig = eight_sink_aig();
+
+  /* electrical single-output: it maps */
+  emap_params ps;
+  ps.electrical_model = true;
+  ps.inverter_delay_drive = true;
+  emap_stats st;
+  auto res = emap_klut( aig, tlib, ps, &st );
+  CHECK( res.num_gates() > 0u );
+
+  /* the block-network cover binds the smallest inverter, and a load-blind cover has no load to
+   * size by: both refuse rather than half-apply the option */
+  emap_params blind = ps;
+  blind.electrical_model = false;
+  CHECK_THROWS_AS( emap_klut( aig, tlib, blind, &st ), std::invalid_argument );
+  emap_params block = ps;
+  block.map_multioutput = true;
+  CHECK_THROWS_AS( emap( aig, tlib, block, &st ), std::invalid_argument );
+}
+
 TEST_CASE( "emap load-aware mapping is off by default", "[emap]" )
 {
   /* The default must be byte-identical to the pre-ADR-0047 behavior: same area, same delay, same
